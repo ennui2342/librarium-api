@@ -5,6 +5,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/fireball1725/librarium-api/internal/models"
@@ -64,6 +65,14 @@ func (r *SeriesVolumesRepo) List(ctx context.Context, seriesID uuid.UUID) ([]*mo
 
 // Sync upserts the provider-fetched volumes. Does NOT delete volumes already in the table
 // that are not in the provider list (so manually-added data is preserved).
+//
+// Continues past a single volume's failure instead of aborting the whole
+// sync — a provider returning one malformed row (e.g. a ReleaseDate that
+// doesn't actually match the "YYYY-MM-DD" the VolumeResult contract
+// promises) previously discarded every other volume in the series along
+// with it, since each row failing an INSERT stopped the loop immediately.
+// Failures are collected and returned together so the caller still knows
+// something was wrong, but whatever did parse is persisted regardless.
 func (r *SeriesVolumesRepo) Sync(ctx context.Context, seriesID uuid.UUID, volumes []providers.VolumeResult) error {
 	const q = `
 		INSERT INTO series_volumes (id, series_id, position, title, release_date, cover_url, external_id)
@@ -75,6 +84,7 @@ func (r *SeriesVolumesRepo) Sync(ctx context.Context, seriesID uuid.UUID, volume
 		    external_id  = COALESCE(EXCLUDED.external_id, series_volumes.external_id),
 		    updated_at   = NOW()`
 
+	var errs []error
 	for _, v := range volumes {
 		id := uuid.New()
 		var releaseDate *string
@@ -82,10 +92,10 @@ func (r *SeriesVolumesRepo) Sync(ctx context.Context, seriesID uuid.UUID, volume
 			releaseDate = &v.ReleaseDate
 		}
 		if _, err := r.db.Exec(ctx, q, id, seriesID, v.Position, v.Title, releaseDate, v.CoverURL, v.ExternalID); err != nil {
-			return fmt.Errorf("upserting series volume at position %v: %w", v.Position, err)
+			errs = append(errs, fmt.Errorf("upserting series volume at position %v: %w", v.Position, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // ListSeriesWithExternalSource returns all series that have an external_source set.
