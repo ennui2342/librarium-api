@@ -1484,6 +1484,8 @@ type FinishedBook struct {
 
 // RecentlyFinished returns the most recently finished books for the user.
 // De-duplicates by book (multiple editions read collapse to a single row).
+// Only considers interactions with a known date_finished — see the
+// GetDashboardStats comment on why there is no updated_at fallback.
 func (r *BookRepo) RecentlyFinished(ctx context.Context, userID uuid.UUID, limit int) ([]*FinishedBook, error) {
 	q := `
 		WITH user_book AS (
@@ -1497,15 +1499,15 @@ func (r *BookRepo) RecentlyFinished(ctx context.Context, userID uuid.UUID, limit
 				b.id AS book_id,
 				ub.library_id,
 				b.title,
-				COALESCE(ubi.date_finished::timestamptz, ubi.updated_at) AS finished_at,
+				ubi.date_finished::timestamptz AS finished_at,
 				ubi.rating,
 				ubi.is_favorite
 			FROM books b
 			JOIN user_book ub ON ub.book_id = b.id
 			JOIN book_editions be ON be.book_id = b.id
 			JOIN user_book_interactions ubi ON ubi.book_edition_id = be.id AND ubi.user_id = $1
-			WHERE ubi.read_status = 'read'
-			ORDER BY b.id, COALESCE(ubi.date_finished::timestamptz, ubi.updated_at) DESC
+			WHERE ubi.read_status = 'read' AND ubi.date_finished IS NOT NULL
+			ORDER BY b.id, ubi.date_finished DESC
 		)
 		SELECT
 			f.book_id, f.library_id, l.name, f.title, f.finished_at, f.rating, f.is_favorite,
