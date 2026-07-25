@@ -356,20 +356,56 @@ func mergeBookResult(dst, src *providers.BookResult) {
 // Sharing any key means two results represent the same book.
 func bookKeys(r *providers.BookResult) []string {
 	var keys []string
+	// Publishers (Panther/Granada especially, in ISFDB's data) commonly reuse
+	// one ISBN across several print runs of the same book years apart. Keying
+	// on ISBN alone would collapse those distinct printings into one, so fold
+	// in year too — an ISBN shared across differing years is treated as
+	// different editions, not a duplicate.
+	y := publishYear(r.PublishDate)
 	if r.ISBN13 != "" {
-		keys = append(keys, "13:"+r.ISBN13)
+		keys = append(keys, "13:"+r.ISBN13+"|"+y)
 	}
 	if r.ISBN10 != "" {
-		keys = append(keys, "10:"+r.ISBN10)
+		keys = append(keys, "10:"+r.ISBN10+"|"+y)
 	}
 	t := normalizeBookToken(r.Title)
 	if t != "" && len(r.Authors) > 0 {
 		a := normalizeBookToken(r.Authors[0])
 		if a != "" {
-			keys = append(keys, "ta:"+t+"|"+a)
+			// Title+author alone identifies a *work*, not an edition — a novel
+			// reprinted a dozen times by different publishers over the decades
+			// (common in ISFDB's data) would otherwise collide into a single
+			// slot and silently lose every edition but the first one merged.
+			// Folding in publisher+year narrows the fallback key to "same
+			// edition, ISBN just wasn't reported by this provider" instead of
+			// "same work, any edition" — distinct editions with no ISBN from
+			// either side now survive as separate results.
+			p := normalizeBookToken(r.Publisher)
+			keys = append(keys, "ta:"+t+"|"+a+"|"+p+"|"+y)
 		}
 	}
 	return keys
+}
+
+// publishYear extracts a leading 4-digit year from a provider's free-form
+// publish date string (e.g. "1973-00-00", "1973", "May 1973"), or "" if none
+// is found. Used only to narrow a dedup key, so an imprecise/missing year is
+// fine — it just means that key component falls back to matching on "".
+func publishYear(s string) string {
+	i := strings.IndexFunc(s, func(r rune) bool { return r >= '0' && r <= '9' })
+	if i < 0 || i+4 > len(s) {
+		return ""
+	}
+	y := s[i : i+4]
+	for _, r := range y {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	if y == "0000" {
+		return ""
+	}
+	return y
 }
 
 // normalizeBookToken lowercases s and strips everything that isn't a letter or digit.
