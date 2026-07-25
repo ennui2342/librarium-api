@@ -51,8 +51,8 @@ func (p *ISFDBProvider) Info() providers.ProviderInfo {
 			providers.CapSeriesVolumes,
 			providers.CapContributor,
 		},
-		HelpText: "ISFDB doesn't offer a public API. Point this at the base URL of your own ISFDB mirror adapter (MariaDB import of ISFDB's weekly backup, fronted by a small JSON API) — leave disabled if you don't run one.",
-		HelpURL:  "https://www.isfdb.org/wiki/index.php/ISFDB:Home",
+		HelpText: "ISFDB doesn't offer a public API. Point this at the base URL of your own ISFDB mirror adapter (MariaDB import of ISFDB's weekly backup, fronted by a small JSON API) — leave disabled if you don't run one. Reference implementation: github.com/ennui2342/isfdb-adapter.",
+		HelpURL:  "https://github.com/ennui2342/isfdb-adapter",
 		ConfigFields: []providers.ConfigField{
 			{
 				Key:         "base_url",
