@@ -525,7 +525,7 @@ query SeriesVolumes($slug: String!) {
     id
     name
     books_count
-    series_books(order_by: {position: asc}) {
+    book_series(order_by: {position: asc}) {
       position
       book {
         title
@@ -828,10 +828,14 @@ type hcSeriesVolumesGQLResponse struct {
 }
 
 type hcSeriesData struct {
-	ID          int            `json:"id"`
-	Name        string         `json:"name"`
-	BooksCount  int            `json:"books_count"`
-	SeriesBooks []hcSeriesBook `json:"series_books"`
+	ID         int            `json:"id"`
+	Name       string         `json:"name"`
+	BooksCount int            `json:"books_count"`
+	// Hardcover's schema field is "book_series" (verified live against
+	// api.hardcover.app — "series_books" doesn't exist and fails GraphQL
+	// validation outright, so this was broken for every Hardcover-linked
+	// series regardless of data quality, not an edge case).
+	SeriesBooks []hcSeriesBook `json:"book_series"`
 }
 
 type hcSeriesBook struct {
