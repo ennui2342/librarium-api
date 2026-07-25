@@ -180,6 +180,21 @@ func parseDate(s string) *time.Time {
 	return nil
 }
 
+// normalizeDateString reduces s to VolumeResult.ReleaseDate's documented
+// "YYYY-MM-DD" or "" contract. The adapter deliberately returns
+// month/year-only precision when that's all ISFDB has (e.g. "1989-02"),
+// which parseDate already accepts (Go's "2006-01"/"2006" layouts imply
+// day 1) — pass it back through so a bare year or year-month, valid input
+// by the adapter's own contract, doesn't reach a downstream `::date` SQL
+// cast as something that isn't actually a date literal.
+func normalizeDateString(s string) string {
+	t := parseDate(s)
+	if t == nil {
+		return ""
+	}
+	return t.Format("2006-01-02")
+}
+
 // ─── BookISBNProvider ───────────────────────────────────────────────────────────
 
 func (p *ISFDBProvider) LookupByISBN(ctx context.Context, isbn string) (*providers.BookResult, error) {
@@ -277,7 +292,7 @@ func (p *ISFDBProvider) FetchSeriesVolumes(ctx context.Context, externalID strin
 		out = append(out, providers.VolumeResult{
 			Position:    v.Position,
 			Title:       v.Title,
-			ReleaseDate: v.ReleaseDate,
+			ReleaseDate: normalizeDateString(v.ReleaseDate),
 			CoverURL:    v.CoverURL,
 			ExternalID:  v.ExternalID,
 		})

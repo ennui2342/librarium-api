@@ -167,3 +167,22 @@ func TestParseDate(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeDateString(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"1940-02-02", "1940-02-02"},
+		// The exact bug: a bare "YYYY-MM" from the adapter must come out as
+		// a real date literal, not pass through unchanged — a downstream
+		// `::date` SQL cast rejects "1989-02" outright.
+		{"1989-02", "1989-02-01"},
+		{"1978", "1978-01-01"},
+		{"1973-00-00", ""},
+		{"garbage", ""},
+	}
+	for _, tc := range cases {
+		if got := normalizeDateString(tc.in); got != tc.want {
+			t.Errorf("normalizeDateString(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
