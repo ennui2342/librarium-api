@@ -132,6 +132,7 @@ func main() {
 	registry.Register(bookProviders.NewGoogleBooksProvider())
 	registry.Register(bookProviders.NewISBNdbProvider())
 	registry.Register(bookProviders.NewHardcoverProvider())
+	registry.Register(bookProviders.NewISFDBProvider())
 	registry.Register(mangaProviders.NewMangaDexProvider())
 	providerSvc := service.NewProviderService(registry, settingsRepo)
 	if err := providerSvc.LoadAll(baseCtx); err != nil {
