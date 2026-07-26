@@ -134,7 +134,9 @@ func (r *Registry) BookSearchProviders() []BookSearchProvider {
 // searchDeadline is how long SearchBooks waits for lagging providers once at
 // least one provider has already returned results.  A slow provider (e.g. Open
 // Library search timing out at 15 s) will not hold up results from fast ones.
-const searchDeadline = 5 * time.Second
+// var, not const, so tests can shrink it rather than sleeping several real
+// seconds per case.
+var searchDeadline = 5 * time.Second
 
 // SearchBooks queries all enabled BookSearchProviders concurrently and returns
 // as soon as every provider has responded OR the deadline is reached.
@@ -165,8 +167,15 @@ func (r *Registry) SearchBooks(ctx context.Context, query string) []*BookResult 
 		}(p)
 	}
 
-	deadline := time.NewTimer(searchDeadline)
-	defer deadline.Stop()
+	// deadlineC stays nil (blocks forever in the select below) until the
+	// first result arrives, matching searchDeadline's doc comment: lagging
+	// providers get searchDeadline *after* a fast one has already
+	// responded, not a flat searchDeadline from the start of the search.
+	// Before any result exists there's no fast provider to protect, so we
+	// wait unboundedly for the first one — each provider's own HTTP client
+	// timeout is still the real worst-case bound, since every goroutine
+	// below sends to ch when its call returns, success or error.
+	var deadlineC <-chan time.Time
 
 	var out []*BookResult
 	remaining := len(providers)
@@ -175,7 +184,12 @@ func (r *Registry) SearchBooks(ctx context.Context, query string) []*BookResult 
 		case res := <-ch:
 			out = append(out, res.items...)
 			remaining--
-		case <-deadline.C:
+			if deadlineC == nil {
+				deadline := time.NewTimer(searchDeadline)
+				defer deadline.Stop()
+				deadlineC = deadline.C
+			}
+		case <-deadlineC:
 			slog.InfoContext(ctx, "book search deadline reached, returning partial results",
 				"query", query, "waiting_on", remaining, "results_so_far", len(out))
 			slog.InfoContext(ctx, "book search done", "query", query, "total", len(out))
