@@ -177,3 +177,51 @@ func TestBool(t *testing.T) {
 		t.Errorf("Bool(\"maybe\") = (%v, %v), want (false, false)", got, ok)
 	}
 }
+
+// Test cases below are drawn from a real Goodreads-to-Librarium import run
+// (2026-08-03) where 13 books were silently duplicated: 10 had no ISBN on
+// either side (import_worker.go's duplicate check is ISBN-gated and never
+// engaged), and 2-3 had a different ISBN because the row represented a
+// different edition/printing of a book already in the library. See
+// BookRepo.FindByNormalizedTitleInLibrary for the repository-side lookup
+// this function feeds.
+func TestNormalizeTitle(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain title", "Vacuum Flowers", "vacuum flowers"},
+		{"leading number", "36 Streets", "36 streets"},
+		{"apostrophe", "I'm Waiting for You and Other Stories", "im waiting for you and other stories"},
+		{
+			"slash, parens, and a trailing date",
+			"Eye for Eye/the Tunesmith (Tor Science Fiction Double) by Orson Scott Card (1990-10-06)",
+			"eye for eyethe tunesmith tor science fiction double by orson scott card 19901006",
+		},
+		{"series suffix with hash and parens", "Children of Memory (Children of Time, #3)", "children of memory children of time 3"},
+		{"mid-word case difference collapses", "THe Last THeorem", "the last theorem"},
+		{"different case, same title, must match", "The Last Theorem", "the last theorem"},
+		{"trailing period abbreviation", "Vol. 8", "vol 8"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := NormalizeTitle(c.in)
+			if got != c.want {
+				t.Errorf("NormalizeTitle(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	// The whole point: two independently-supplied titles for the same
+	// work must normalize to the same key regardless of case/punctuation
+	// differences between the CSV row and what's already stored.
+	if NormalizeTitle("THe Last THeorem") != NormalizeTitle("The Last Theorem") {
+		t.Error("NormalizeTitle should be case-insensitive: \"THe Last THeorem\" and \"The Last Theorem\" must match")
+	}
+	if NormalizeTitle("Vacuum Flowers") != NormalizeTitle("vacuum flowers") {
+		t.Error("NormalizeTitle should be case-insensitive")
+	}
+}

@@ -777,6 +777,33 @@ func (r *BookRepo) List(ctx context.Context, libraryID uuid.UUID, opts ListBooks
 	return books, total, nil
 }
 
+// FindByNormalizedTitleInLibrary looks up a book already held by the given
+// library whose title, lowercased with punctuation stripped, exactly
+// matches normalizedTitle. Used by the CSV importer as a fallback duplicate
+// check when ISBN-based dedup can't run (no ISBN on the row, or the ISBN
+// belongs to a different edition/printing than what's already catalogued)
+// — see imports.NormalizeTitle, which callers must use to produce
+// normalizedTitle so both sides agree on the same normalization rule.
+// Returns ErrNotFound if no book in this library has a matching title.
+func (r *BookRepo) FindByNormalizedTitleInLibrary(ctx context.Context, libraryID uuid.UUID, normalizedTitle string) (uuid.UUID, error) {
+	const q = `
+		SELECT b.id
+		FROM books b
+		JOIN library_books lb ON lb.book_id = b.id
+		WHERE lb.library_id = $1
+		  AND lower(regexp_replace(b.title, '[[:punct:]]', '', 'g')) = $2
+		LIMIT 1`
+	var id uuid.UUID
+	err := r.db.QueryRow(ctx, q, libraryID, normalizedTitle).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, ErrNotFound
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("finding book by normalized title: %w", err)
+	}
+	return id, nil
+}
+
 // SearchSuggestions returns up to 5 book titles in the library whose
 // (title || subtitle) is similar to the supplied query, ranked by trgm
 // distance. Used by the books-search "did you mean" fallback when a
