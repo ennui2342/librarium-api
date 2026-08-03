@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"time"
 
 	"github.com/fireball1725/librarium-api/internal/providers"
 	"github.com/fireball1725/librarium-api/internal/repository"
@@ -243,7 +244,29 @@ func (s *ProviderService) SearchSeries(ctx context.Context, query string) []prov
 // SearchBooks queries all enabled BookSearch providers, then ranks and deduplicates
 // results according to the configured provider priority order.
 func (s *ProviderService) SearchBooks(ctx context.Context, query string) []*providers.BookResult {
-	results := s.registry.SearchBooks(ctx, query)
+	return s.searchAndRank(ctx, query, s.registry.SearchBooks)
+}
+
+// bestMatchesSearchDeadline is how long BestMatches waits for lagging
+// providers once the first has responded — longer than the registry's
+// default searchDeadline (5s, tuned for the snappy "By Title" search).
+// Best Matches is a deliberately slower, more thorough operation the user
+// already expects to wait on once per book, and it specifically needs
+// ISFDB's depth (many editions per title means more per-title round-trips
+// in the mirror adapter). Found live 2026-08-03: a real ISFDB query
+// answered in ~1s in isolation but was still getting dropped via "context
+// canceled" under the 5s default when racing five other providers
+// concurrently — 5s wasn't a safety margin for ISFDB here, it was cutting
+// it off before it could realistically finish under real contention.
+const bestMatchesSearchDeadline = 15 * time.Second
+
+// searchAndRank runs `search` (either the registry's default-deadline
+// SearchBooks or a deadline override) then applies the same provider-
+// priority ranking/dedup SearchBooks and BestMatches both rely on — kept
+// as one shared path so the two callers can't silently drift in how they
+// dedupe results.
+func (s *ProviderService) searchAndRank(ctx context.Context, query string, search func(context.Context, string) []*providers.BookResult) []*providers.BookResult {
+	results := search(ctx, query)
 	if len(results) == 0 {
 		return results
 	}
@@ -317,7 +340,9 @@ func (s *ProviderService) BestMatches(ctx context.Context, known BookFields) []S
 		return nil
 	}
 
-	candidates := s.SearchBooks(ctx, query)
+	candidates := s.searchAndRank(ctx, query, func(ctx context.Context, q string) []*providers.BookResult {
+		return s.registry.SearchBooksWithDeadline(ctx, q, bestMatchesSearchDeadline)
+	})
 	scored := make([]ScoredResult, len(candidates))
 	for i, c := range candidates {
 		scored[i] = ScoreCandidate(known, c)

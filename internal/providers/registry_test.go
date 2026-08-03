@@ -85,3 +85,42 @@ func TestSearchBooks_DropsStragglerPastGracePeriodAfterFirstResult(t *testing.T)
 		t.Fatalf("got %+v, want exactly the fast provider's result — the straggler should have been dropped", out)
 	}
 }
+
+// Regression test for the bug found live 2026-08-03: a real ISFDB query
+// answered in ~1s in isolation but was still getting cut off by the
+// default 5s searchDeadline when racing five other providers concurrently
+// as part of the "Best Matches" flow — the exact case that flow depends on
+// ISFDB for. SearchBooksWithDeadline must honor a longer, explicitly-passed
+// deadline without touching the package-level default used by plain
+// SearchBooks (the "By Title" tab), which should stay snappy.
+func TestSearchBooksWithDeadline_HonorsExplicitDeadlineIndependentlyOfDefault(t *testing.T) {
+	// Package default stays small — if SearchBooksWithDeadline secretly
+	// fell back to it instead of the explicit argument, this straggler
+	// would still get dropped and the test would fail.
+	withSearchDeadline(t, 50*time.Millisecond)
+
+	r := NewRegistry()
+	r.Register(&fakeSearchProvider{name: "fast", delay: 0})
+	// Would be dropped under the 50ms default (same shape as the
+	// straggler test above), but 300ms is comfortably inside an explicit
+	// 500ms deadline.
+	r.Register(&fakeSearchProvider{name: "isfdb-like-straggler", delay: 300 * time.Millisecond})
+
+	out := r.SearchBooksWithDeadline(context.Background(), "query", 500*time.Millisecond)
+
+	if len(out) != 2 {
+		t.Fatalf("got %d results, want 2 — the straggler should survive under the explicit 500ms deadline: %+v", len(out), out)
+	}
+
+	// Meanwhile plain SearchBooks (no explicit deadline) must still use the
+	// small package default and drop the same straggler — proving the two
+	// entry points are genuinely independent, not just that a long enough
+	// explicit deadline papers over a shared bug.
+	r2 := NewRegistry()
+	r2.Register(&fakeSearchProvider{name: "fast", delay: 0})
+	r2.Register(&fakeSearchProvider{name: "isfdb-like-straggler", delay: 300 * time.Millisecond})
+	defaultOut := r2.SearchBooks(context.Background(), "query")
+	if len(defaultOut) != 1 || defaultOut[0].Provider != "fast" {
+		t.Fatalf("plain SearchBooks got %+v, want only the fast provider under the small package default", defaultOut)
+	}
+}
