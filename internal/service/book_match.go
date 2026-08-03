@@ -83,12 +83,22 @@ const yearDecayWindow = 15.0
 // ScoreCandidate compares a candidate provider result against a book's
 // already-known fields and returns a normalized [0,1] score plus a bucket.
 //
-// Missing data is neutral, never penalized: a field is only scored when
-// both sides have a value, and the final score is a weighted average over
-// just the fields that were actually present — not a weighted sum against
-// a fixed total, which would otherwise silently punish a candidate for a
-// gap in a source's data (ISFDB's own data has plenty of these) as if it
-// were a genuine mismatch.
+// Missing data is neutral, not penalized like a genuine mismatch — but
+// "neutral" means exactly that: a field with no data on either side
+// contributes a middle-of-the-road 0.5, not "skip it and don't count its
+// weight at all." That distinction matters and was wrong in an earlier
+// version of this function: normalizing only over the fields actually
+// present let a candidate with *less* data systematically outscore, even
+// tie, a candidate with *more* data that was a genuine, fuller match —
+// found live 2026-08-03, where a completely blank-metadata "Neuromancer"
+// candidate scored a perfect 1.0 (title+author only, nothing to drag the
+// average down) while the actual correct 1993 edition — matching on
+// title, author, format, *and* year — scored lower simply for having more
+// fields available to (almost) match on. The fix: every field always
+// counts its full weight in the denominator; an absent field contributes
+// weight*0.5 to the numerator (better than a real mismatch's 0, worse
+// than not counting against the total at all) rather than being excluded
+// from both sides of the ratio.
 //
 // One short-circuit: an exact ISBN match (either ISBN-10 or ISBN-13, on
 // either side) is a certain match — return immediately at the top score/bucket
@@ -100,33 +110,45 @@ func ScoreCandidate(known BookFields, candidate *providers.BookResult) ScoredRes
 		return ScoredResult{Result: candidate, Score: 1, Bucket: MatchLikely}
 	}
 
+	// neutralFieldScore is what an absent field contributes toward the
+	// weighted sum — see the "missing data is neutral" doc above for why
+	// this is 0.5 (a real, unresolved unknown) rather than 0 (a genuine
+	// mismatch) or being excluded from the total entirely.
+	const neutralFieldScore = 0.5
+
 	type weighted struct {
 		weight float64
 		score  float64
 	}
-	var present []weighted
-
+	fields := []weighted{
+		{weightTitle, neutralFieldScore},
+		{weightAuthor, neutralFieldScore},
+		{weightFormat, neutralFieldScore},
+		{weightYear, neutralFieldScore},
+		{weightLanguage, neutralFieldScore},
+		{weightPublisher, neutralFieldScore},
+	}
 	if s, ok := titleScore(known.Title, candidate.Title); ok {
-		present = append(present, weighted{weightTitle, s})
+		fields[0].score = s
 	}
 	if s, ok := authorScore(known.Authors, candidate.Authors); ok {
-		present = append(present, weighted{weightAuthor, s})
+		fields[1].score = s
 	}
 	if s, ok := formatScore(known.Format, candidate.Format); ok {
-		present = append(present, weighted{weightFormat, s})
+		fields[2].score = s
 	}
 	if s, ok := yearScore(known.PublishYear, parseYear(candidate.PublishDate)); ok {
-		present = append(present, weighted{weightYear, s})
+		fields[3].score = s
 	}
-	if s, ok := stringExactScore(known.Language, candidate.Language); ok {
-		present = append(present, weighted{weightLanguage, s})
+	if s, ok := languageScore(known.Language, candidate.Language); ok {
+		fields[4].score = s
 	}
 	if s, ok := publisherScore(known.Publisher, candidate.Publisher); ok {
-		present = append(present, weighted{weightPublisher, s})
+		fields[5].score = s
 	}
 
 	var weightSum, scoreSum float64
-	for _, f := range present {
+	for _, f := range fields {
 		weightSum += f.weight
 		scoreSum += f.weight * f.score
 	}
@@ -273,37 +295,73 @@ func parseYear(publishDate string) *int {
 	return &n
 }
 
-// stringExactScore is a simple case-insensitive exact-match score, used for
-// language: 1 on an exact match, 0 on a genuine mismatch, "not present" when
-// either side is blank. Deliberately not fuzzy — language codes/names don't
-// benefit from partial-overlap scoring the way titles/authors do, and this
-// stays a low-weight signal specifically because blank language data is
-// common enough that it shouldn't swing a result much either way.
-func stringExactScore(a, b string) (float64, bool) {
-	a = strings.ToLower(strings.TrimSpace(a))
-	b = strings.ToLower(strings.TrimSpace(b))
-	if a == "" || b == "" {
+// iso639Alpha3 maps the common ISO 639-2 (3-letter) codes to their 639-1
+// (2-letter) equivalent, for languages likely to actually show up in a
+// personal library. Sources disagree on which standard they emit — found
+// live 2026-08-03: ISFDB returns "eng" while Librarium's own edition
+// records store "en", so an exact-string language comparison silently
+// treated the *same* language as a mismatch. Not exhaustive (639 has ~7000
+// entries via 639-3); falls back to plain string comparison for anything
+// not listed here rather than failing closed.
+var iso639Alpha3 = map[string]string{
+	"eng": "en", "ger": "de", "deu": "de", "fre": "fr", "fra": "fr",
+	"spa": "es", "ita": "it", "por": "pt", "dut": "nl", "nld": "nl",
+	"rus": "ru", "jpn": "ja", "chi": "zh", "zho": "zh", "kor": "ko",
+	"pol": "pl", "swe": "sv", "dan": "da", "nor": "no", "fin": "fi",
+}
+
+func normalizeLanguage(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if two, ok := iso639Alpha3[s]; ok {
+		return two
+	}
+	return s
+}
+
+// languageScore is a case-insensitive match on language, normalized across
+// the common ISO 639-1/639-2 code variants (see iso639Alpha3) since
+// providers don't agree on which one they emit. Deliberately not fuzzy
+// beyond that normalization — language codes don't benefit from partial-
+// overlap scoring the way titles/authors do, and this stays a low-weight
+// signal specifically because blank language data is common enough that it
+// shouldn't swing a result much either way.
+func languageScore(a, b string) (float64, bool) {
+	na, nb := normalizeLanguage(a), normalizeLanguage(b)
+	if na == "" || nb == "" {
 		return 0, false
 	}
-	if a == b {
+	if na == nb {
 		return 1, true
 	}
 	return 0, true
 }
 
-// publisherScore is intentionally the least sophisticated of the fuzzy
-// comparisons — publisher naming is the least consistent field across
-// sources (imprint vs. parent company, "Tor" vs "Tor Books" vs "Tom
-// Doherty Associates"), so this is low-weight by design and only needs to
-// catch the easy cases: exact match after normalization, or one name
-// containing the other.
+// publisherScore uses the same token-Jaccard approach as title/author
+// rather than substring containment — found live 2026-08-03: ISFDB's
+// "HarperCollins (UK)" vs. a book record's "HarperCollins Publishers"
+// share no substring relationship in either direction (neither contains
+// the other whole), even though they're clearly the same publisher.
+// Jaccard over word tokens gives partial credit for the shared
+// "harpercollins" token instead of scoring a real match as a hard zero.
+// Still the least sophisticated of the fuzzy comparisons on purpose —
+// publisher naming is the least consistent field across sources (imprint
+// vs. parent company, regional qualifiers), hence the low weight.
 func publisherScore(a, b string) (float64, bool) {
-	na, nb := normalizeBookToken(a), normalizeBookToken(b)
-	if na == "" || nb == "" {
+	ta, tb := publisherTokens(a), publisherTokens(b)
+	if len(ta) == 0 || len(tb) == 0 {
 		return 0, false
 	}
-	if na == nb || strings.Contains(na, nb) || strings.Contains(nb, na) {
-		return 1, true
+	return jaccard(ta, tb), true
+}
+
+func publisherTokens(s string) []string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte(' ')
+		}
 	}
-	return 0, true
+	return strings.Fields(b.String())
 }
