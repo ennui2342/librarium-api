@@ -337,6 +337,9 @@ func NewRouter(ctx context.Context, db *pgxpool.Pool, cfg *config.Config, riverC
 	// Single-book re-enrichment — works for floating books too since
 	// enrichment_batches.library_id is nullable post-000009.
 	mux.Handle("POST /api/v1/books/{book_id}/enrich", requireAuth(http.HandlerFunc(bookHandler.EnrichBook)))
+	// Same library-agnostic reasoning as enrich — a book's own metadata
+	// (and finding candidates to match it against) isn't library-scoped.
+	mux.Handle("GET /api/v1/books/{book_id}/best-matches", requireAuth(http.HandlerFunc(providerHandler.BestMatches)))
 	mux.Handle("POST /api/v1/libraries/{library_id}/books/{book_id}/cover/fetch", requireLibraryPerm("books:update", http.HandlerFunc(bookHandler.FetchBookCover)))
 	mux.Handle("PUT /api/v1/libraries/{library_id}/books/{book_id}/cover", requireLibraryPerm("books:update", http.HandlerFunc(bookHandler.UploadBookCover)))
 	mux.Handle("DELETE /api/v1/libraries/{library_id}/books/{book_id}/cover", requireLibraryPerm("books:update", http.HandlerFunc(bookHandler.DeleteBookCover)))

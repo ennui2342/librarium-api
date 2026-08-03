@@ -6,13 +6,16 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/fireball1725/librarium-api/internal/api/respond"
 	"github.com/fireball1725/librarium-api/internal/providers"
+	"github.com/fireball1725/librarium-api/internal/repository"
 	"github.com/fireball1725/librarium-api/internal/service"
+	"github.com/google/uuid"
 )
 
 type ProviderHandler struct {
@@ -246,6 +249,55 @@ func (h *ProviderHandler) SearchBooks(w http.ResponseWriter, r *http.Request) {
 		"results", len(results),
 		"elapsed", time.Since(start).String(),
 		"ctx_err", ctx.Err(),
+	)
+	respond.JSON(w, http.StatusOK, results)
+}
+
+// BestMatches godoc
+//
+// @Summary     Find and rank provider candidates against a book's own metadata
+// @Description Loads the book's already-known title/authors/publisher/year/language/format/ISBN, searches all enabled providers, and returns candidates scored and bucketed by similarity to that known data — ranked highest first. Distinct from SearchBooks (plain, unranked freetext) — this is the "which edition is this" flow, seeded entirely from data the book record already has.
+// @Tags        lookup
+// @Produce     json
+// @Security    BearerAuth
+// @Param       book_id  path      string  true  "Book UUID"
+// @Success     200      {array}   service.ScoredResult
+// @Failure     400      {object}  object{error=string}
+// @Failure     401      {object}  object{error=string}
+// @Failure     404      {object}  object{error=string}
+// @Router      /books/{book_id}/best-matches [get]
+func (h *ProviderHandler) BestMatches(w http.ResponseWriter, r *http.Request) {
+	bookID, err := uuid.Parse(r.PathValue("book_id"))
+	if err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid book id")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	known, err := h.svc.LoadBookFields(ctx, bookID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			respond.Error(w, http.StatusNotFound, "book not found")
+			return
+		}
+		respond.ServerError(w, r, err)
+		return
+	}
+
+	slog.InfoContext(r.Context(), "BestMatches handler entered", "book_id", bookID, "title", known.Title)
+	start := time.Now()
+
+	results := h.svc.BestMatches(ctx, known)
+	if results == nil {
+		results = []service.ScoredResult{}
+	}
+
+	slog.InfoContext(r.Context(), "BestMatches handler done",
+		"book_id", bookID,
+		"results", len(results),
+		"elapsed", time.Since(start).String(),
 	)
 	respond.JSON(w, http.StatusOK, results)
 }
