@@ -118,6 +118,25 @@ type BookSearchProvider interface {
 	SearchBooks(ctx context.Context, query string) ([]*BookResult, error)
 }
 
+// DeepBookSearchProvider is an optional extension of BookSearchProvider for
+// providers whose results are structured as one title with many editions
+// rather than a flat list of distinct works — currently only ISFDB, where a
+// classic can have hundreds of editions (Dracula: 348) and the specific one
+// a caller wants can be arbitrarily far down that list. Plain SearchBooks
+// callers (the quick "By Title" search) get that provider's normal,
+// modest-depth results and a snappy response; a caller that specifically
+// needs to find one known printing among many (Best Matches, ranking
+// against a book's own already-known metadata) calls SearchBooksDeep
+// instead and accepts a slower, more complete response in exchange. A
+// provider with no meaningful notion of "many editions of one title" (Google
+// Books, Hardcover, etc.) simply doesn't implement this — the registry
+// falls back to plain SearchBooks for it either way, see
+// Registry.SearchBooksDeepWithDeadline.
+type DeepBookSearchProvider interface {
+	BookSearchProvider
+	SearchBooksDeep(ctx context.Context, query string) ([]*BookResult, error)
+}
+
 // SeriesSearchProvider can search for series by name.
 type SeriesSearchProvider interface {
 	MetadataProvider

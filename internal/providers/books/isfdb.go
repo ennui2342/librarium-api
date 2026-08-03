@@ -260,30 +260,50 @@ func (b *isfdbBook) toBookResult() *providers.BookResult {
 
 // ─── BookSearchProvider ─────────────────────────────────────────────────────────
 
-// searchEditionsPerTitle/searchLimit override the adapter's own defaults
-// (10 editions per matched title, 20 results total). The adapter orders
-// editions oldest-first before Go-side ranking ever sees them — any fixed
-// cap smaller than a title's real edition count silently excludes whatever
-// fell past it, regardless of how good the ranking algorithm is. This was
-// tuned to 25 once (matching Neuromancer's 66 editions, target ~17th
-// oldest) but that was curve-fitting to one example: ISFDB's own data has
-// far more prolific titles — Dracula alone has 348 editions, several
-// classics exceed 150 — so a small fixed cap just relocates the same bug
-// to a longer tail. The correctness-safe design is to filter *after*
-// ranking, not before: fetch generously here (verified live 2026-08-03,
-// Dracula's full ~400-candidate response took 5.73s single-provider,
-// comfortably inside BestMatches' deadline — see providers.go), let
-// ScoreCandidate rank the complete set, and truncate for display only
-// after that ranking has happened (bestMatchesResultLimit in providers.go).
+// deepSearchEditionsPerTitle/deepSearchLimit override the adapter's own
+// defaults (10 editions per matched title, 20 results total) for
+// SearchBooksDeep only — plain SearchBooks (the quick "By Title" tab) keeps
+// the adapter's defaults and stays fast. The adapter orders editions
+// oldest-first before Go-side ranking ever sees them — any fixed cap
+// smaller than a title's real edition count silently excludes whatever
+// fell past it, regardless of how good the ranking algorithm is. Tuning
+// this to a modest number (e.g. 25, matching Neuromancer's 66 editions)
+// would just be curve-fitting to one example: ISFDB's own data has far more
+// prolific titles — Dracula alone has 348 editions, several classics
+// exceed 150. The correctness-safe design is to filter *after* ranking,
+// not before: fetch generously here (verified live 2026-08-03, Dracula's
+// full ~400-candidate response took 5.73s single-provider, comfortably
+// inside Best Matches' deadline — see service.bestMatchesSearchDeadline),
+// let ScoreCandidate rank the complete set, and truncate for display only
+// after that ranking has happened (service.bestMatchesResultLimit).
+//
+// Keeping this off the plain search path matters — found live 2026-08-03,
+// point-in-time: with both paths sharing one SearchBooks call sized for
+// deep search, a plain "Dracula" search took 4.31s against that path's much
+// tighter 5s default deadline. Not a correctness bug (worst case is a
+// slower/occasionally-partial plain search, not a wrong answer) but
+// needless risk for a path that never needed the depth in the first place.
 const (
-	searchEditionsPerTitle = 400
-	searchLimit            = 500
+	deepSearchEditionsPerTitle = 400
+	deepSearchLimit            = 500
 )
 
 func (p *ISFDBProvider) SearchBooks(ctx context.Context, query string) ([]*providers.BookResult, error) {
-	var books []isfdbBook
+	return p.searchBooks(ctx, "/search?q="+url.QueryEscape(query))
+}
+
+// SearchBooksDeep implements providers.DeepBookSearchProvider — see
+// deepSearchEditionsPerTitle's doc for why this needs different adapter
+// query params than plain SearchBooks, and Registry.SearchBooksDeepWithDeadline
+// for how callers reach this instead of SearchBooks.
+func (p *ISFDBProvider) SearchBooksDeep(ctx context.Context, query string) ([]*providers.BookResult, error) {
 	path := fmt.Sprintf("/search?q=%s&editions_per_title=%d&limit=%d",
-		url.QueryEscape(query), searchEditionsPerTitle, searchLimit)
+		url.QueryEscape(query), deepSearchEditionsPerTitle, deepSearchLimit)
+	return p.searchBooks(ctx, path)
+}
+
+func (p *ISFDBProvider) searchBooks(ctx context.Context, path string) ([]*providers.BookResult, error) {
+	var books []isfdbBook
 	if err := p.fetchJSON(ctx, path, &books); err != nil {
 		if _, ok := err.(errNotFound); ok {
 			return nil, nil

@@ -358,7 +358,7 @@ func (s *ProviderService) BestMatches(ctx context.Context, known BookFields) []S
 	}
 
 	candidates := s.searchAndRank(ctx, query, func(ctx context.Context, q string) []*providers.BookResult {
-		return s.registry.SearchBooksWithDeadline(ctx, q, bestMatchesSearchDeadline)
+		return s.registry.SearchBooksDeepWithDeadline(ctx, q, bestMatchesSearchDeadline)
 	})
 	scored := make([]ScoredResult, len(candidates))
 	for i, c := range candidates {
