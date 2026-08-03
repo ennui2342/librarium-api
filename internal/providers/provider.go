@@ -70,6 +70,11 @@ type BookResult struct {
 	// Categories contains subject/genre tags from the provider (e.g. "Comics & Graphic Novels / Manga").
 	// Used by the client to auto-detect the media type.
 	Categories []string `json:"categories"`
+	// Format is one of models.EditionFormat's canonical values (paperback |
+	// hardcover | ebook | audiobook | digital), or "" when the provider
+	// doesn't carry binding/format data. Only ISFDB populates this today —
+	// Google Books/Hardcover/etc. don't expose per-edition binding info.
+	Format string `json:"format"`
 }
 
 // SeriesResult is a normalised series record returned by a SeriesSearchProvider.

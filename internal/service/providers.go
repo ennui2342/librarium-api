@@ -13,6 +13,7 @@ import (
 
 	"github.com/fireball1725/librarium-api/internal/providers"
 	"github.com/fireball1725/librarium-api/internal/repository"
+	"github.com/google/uuid"
 )
 
 const (
@@ -24,10 +25,15 @@ const (
 type ProviderService struct {
 	registry *providers.Registry
 	settings *repository.SettingsRepo
+	// books/editions back BestMatches' server-side load of a book's known
+	// fields — see LoadBookFields. Read-only from this service's
+	// perspective; it never writes through these.
+	books    *repository.BookRepo
+	editions *repository.EditionRepo
 }
 
-func NewProviderService(registry *providers.Registry, settings *repository.SettingsRepo) *ProviderService {
-	return &ProviderService{registry: registry, settings: settings}
+func NewProviderService(registry *providers.Registry, settings *repository.SettingsRepo, books *repository.BookRepo, editions *repository.EditionRepo) *ProviderService {
+	return &ProviderService{registry: registry, settings: settings, books: books, editions: editions}
 }
 
 // LoadAll reads provider configs from the DB and applies them to the registry.
@@ -246,6 +252,80 @@ func (s *ProviderService) SearchBooks(ctx context.Context, query string) []*prov
 	return rankAndDeduplicateBooks(results, order)
 }
 
+// LoadBookFields reads a book's already-known metadata (title, authors,
+// publisher/year/language, and the primary edition's format/ISBNs) for use
+// as the target of BestMatches' scoring. Library-agnostic (uuid.Nil), same
+// as EnrichBook — a book's own metadata isn't library-scoped, and this read
+// only needs the book to exist, not a particular library's membership of it.
+func (s *ProviderService) LoadBookFields(ctx context.Context, bookID uuid.UUID) (BookFields, error) {
+	book, err := s.books.FindByID(ctx, bookID, uuid.Nil, uuid.Nil)
+	if err != nil {
+		return BookFields{}, fmt.Errorf("loading book: %w", err)
+	}
+
+	fields := BookFields{
+		Title:     book.Title,
+		Publisher: book.Publisher,
+		Language:  book.Language,
+	}
+	if book.PublishYear != nil {
+		y := *book.PublishYear
+		fields.PublishYear = &y
+	}
+	for _, c := range book.Contributors {
+		if c.Role == "author" || c.Role == "writer" {
+			fields.Authors = append(fields.Authors, c.Name)
+		}
+	}
+	if len(fields.Authors) == 0 {
+		// No contributor explicitly tagged author/writer (e.g. illustrator-only
+		// entry, or role data that predates a consistent convention) — fall
+		// back to everyone credited rather than searching with no author at
+		// all, which would make the candidate pool title-only and much noisier.
+		for _, c := range book.Contributors {
+			fields.Authors = append(fields.Authors, c.Name)
+		}
+	}
+
+	editions, err := s.editions.ListByBook(ctx, bookID)
+	if err != nil {
+		return BookFields{}, fmt.Errorf("loading editions: %w", err)
+	}
+	for _, e := range editions {
+		if !e.IsPrimary {
+			continue
+		}
+		fields.Format = e.Format
+		fields.ISBN10 = e.ISBN10
+		fields.ISBN13 = e.ISBN13
+		break
+	}
+	return fields, nil
+}
+
+// BestMatches finds and scores provider candidates against a book's own
+// already-known fields, ranked highest-score first. Reuses SearchBooks for
+// the candidate pool (same fan-out, dedup, and provider-priority merge as
+// the plain by-title search) — the only new work here is scoring each
+// result against `known` instead of returning them unranked.
+func (s *ProviderService) BestMatches(ctx context.Context, known BookFields) []ScoredResult {
+	query := strings.TrimSpace(known.Title)
+	if len(known.Authors) > 0 {
+		query = strings.TrimSpace(query + " " + known.Authors[0])
+	}
+	if query == "" {
+		return nil
+	}
+
+	candidates := s.SearchBooks(ctx, query)
+	scored := make([]ScoredResult, len(candidates))
+	for i, c := range candidates {
+		scored[i] = ScoreCandidate(known, c)
+	}
+	stableSort(scored, func(a, b ScoredResult) bool { return a.Score > b.Score })
+	return scored
+}
+
 // rankAndDeduplicateBooks sorts results by provider priority order and removes
 // duplicates, keeping the highest-priority provider's version of each book.
 // Two results are considered the same book when they share an ISBN-13, ISBN-10,
@@ -349,6 +429,9 @@ func mergeBookResult(dst, src *providers.BookResult) {
 	}
 	if len(dst.Categories) == 0 {
 		dst.Categories = src.Categories
+	}
+	if dst.Format == "" {
+		dst.Format = src.Format
 	}
 }
 

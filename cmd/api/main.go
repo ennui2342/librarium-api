@@ -134,7 +134,7 @@ func main() {
 	registry.Register(bookProviders.NewHardcoverProvider())
 	registry.Register(bookProviders.NewISFDBProvider())
 	registry.Register(mangaProviders.NewMangaDexProvider())
-	providerSvc := service.NewProviderService(registry, settingsRepo)
+	providerSvc := service.NewProviderService(registry, settingsRepo, repository.NewBookRepo(pool), repository.NewEditionRepo(pool))
 	if err := providerSvc.LoadAll(baseCtx); err != nil {
 		slog.Warn("failed to load provider settings", "error", err)
 	}

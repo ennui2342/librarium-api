@@ -90,6 +90,36 @@ type isfdbBook struct {
 	Language    string   `json:"language"`
 	PageCount   *int     `json:"page_count"`
 	Categories  []string `json:"categories"`
+	// Binding is ISFDB's raw pub_ptype ("hc", "tp", "pb", "ebook", "audio CD",
+	// etc.) — mapped to providers.BookResult's canonical Format via
+	// mapISFDBBinding rather than passed through as-is.
+	Binding string `json:"binding"`
+}
+
+// mapISFDBBinding maps ISFDB's pub_ptype vocabulary onto
+// providers.BookResult's canonical format values (paperback | hardcover |
+// ebook | audiobook | digital). ISFDB's vocabulary is print-binding-shape
+// focused (digest/pulp/bedsheet/octavo/quarto/A4/A5/tabloid are all
+// physical trim sizes, not separate "kinds" of book) — anything print but
+// not explicitly hardcover buckets into "paperback" as the closest
+// available canonical value. "unknown"/"other"/anything unrecognized maps
+// to "" (absent), not a default guess — see formatScore's comment on why
+// guessing here would be actively harmful to matching.
+func mapISFDBBinding(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "hc":
+		return "hardcover"
+	case "tp", "pb", "digest", "pulp", "bedsheet", "octavo", "quarto",
+		"a4", "a5", "tabloid", "ph", "webzine", "dos":
+		return "paperback"
+	case "ebook":
+		return "ebook"
+	case "audio cassette", "audio cd", "audio lp", "audio mp3 cd", "audio mp3 dvd",
+		"audio mp3 usb drive", "digital audio download", "digital audio player":
+		return "audiobook"
+	default:
+		return ""
+	}
 }
 
 type isfdbSeries struct {
@@ -224,6 +254,7 @@ func (b *isfdbBook) toBookResult() *providers.BookResult {
 		Language:        b.Language,
 		PageCount:       b.PageCount,
 		Categories:      b.Categories,
+		Format:          mapISFDBBinding(b.Binding),
 	}
 }
 
