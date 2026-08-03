@@ -274,11 +274,11 @@ func (h *ProviderHandler) BestMatches(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Longer than SearchBooks' 20s: BestMatches' inner search deadline
-	// (service.bestMatchesSearchDeadline, 15s) needs headroom above it, or
+	// (service.bestMatchesSearchDeadline, 20s) needs headroom above it, or
 	// this outer timeout would cancel the request — and the still-running
 	// straggler goroutines it's waiting on — before that inner deadline
 	// ever gets a chance to fire and return partial results itself.
-	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	known, err := h.svc.LoadBookFields(ctx, bookID)
