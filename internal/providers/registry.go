@@ -151,14 +151,47 @@ func (r *Registry) SearchBooks(ctx context.Context, query string) []*BookResult 
 // caller has the same latency budget: a quick freetext search (the "By
 // Title" tab) wants the default snappy 5s cutoff, but the "Best Matches"
 // flow is already a deliberately slower, more thorough operation the user
-// is waiting on once per book — and it specifically needs ISFDB's depth
-// (many editions per title means more per-title DB round-trips in the
-// mirror adapter), so cutting ISFDB off at the same 5s used for a plain
-// title search defeats the point of that flow. Found live 2026-08-03: ISFDB
-// answered a real query in ~1s in isolation but was still getting dropped
-// via "context canceled" under the default deadline when racing five other
-// providers concurrently.
+// is waiting on once per book. Every provider is called via its plain
+// SearchBooks — see SearchBooksDeepWithDeadline for the variant that also
+// asks DeepBookSearchProvider-capable providers (ISFDB) for their full
+// depth, which is what Best Matches actually needs (see that method's doc).
 func (r *Registry) SearchBooksWithDeadline(ctx context.Context, query string, deadline time.Duration) []*BookResult {
+	return r.fanOutBookSearch(ctx, query, deadline, func(bp BookSearchProvider, ctx context.Context, query string) ([]*BookResult, error) {
+		return bp.SearchBooks(ctx, query)
+	})
+}
+
+// SearchBooksDeepWithDeadline is SearchBooksWithDeadline, except providers
+// implementing DeepBookSearchProvider are asked via SearchBooksDeep instead
+// of plain SearchBooks — everything else about the fan-out/deadline
+// mechanics is identical. For Best Matches specifically: it needs to find
+// one already-known edition among however many a title actually has (ISFDB:
+// Dracula alone has 348), not the modest depth a quick freetext search
+// wants. Found live 2026-08-03: ISFDB answered a real query in ~1s in
+// isolation but was still getting dropped via "context canceled" under the
+// default 5s deadline when racing five other providers concurrently, and
+// even once that was fixed, a small fixed edition-per-title cap on the
+// plain path just relocated the same "correct answer excluded before
+// ranking ever saw it" bug further out — see isfdb.go's SearchBooksDeep.
+func (r *Registry) SearchBooksDeepWithDeadline(ctx context.Context, query string, deadline time.Duration) []*BookResult {
+	return r.fanOutBookSearch(ctx, query, deadline, func(bp BookSearchProvider, ctx context.Context, query string) ([]*BookResult, error) {
+		if deep, ok := bp.(DeepBookSearchProvider); ok {
+			return deep.SearchBooksDeep(ctx, query)
+		}
+		return bp.SearchBooks(ctx, query)
+	})
+}
+
+// fanOutBookSearch is the concurrent-fan-out-with-post-first-result-deadline
+// mechanics shared by SearchBooksWithDeadline and SearchBooksDeepWithDeadline
+// — the only thing that differs between them is which method `search` ends
+// up calling on each provider.
+func (r *Registry) fanOutBookSearch(
+	ctx context.Context,
+	query string,
+	deadline time.Duration,
+	search func(bp BookSearchProvider, ctx context.Context, query string) ([]*BookResult, error),
+) []*BookResult {
 	providers := r.BookSearchProviders()
 	slog.InfoContext(ctx, "book search start", "query", query, "providers", len(providers))
 	if len(providers) == 0 {
@@ -174,7 +207,7 @@ func (r *Registry) SearchBooksWithDeadline(ctx context.Context, query string, de
 	for _, p := range providers {
 		go func(bp BookSearchProvider) {
 			name := bp.Info().Name
-			items, err := bp.SearchBooks(ctx, query)
+			items, err := search(bp, ctx, query)
 			if err != nil {
 				slog.WarnContext(ctx, "book search provider error", "provider", name, "error", err)
 				ch <- result{name: name}
