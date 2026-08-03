@@ -415,6 +415,71 @@ func (s *BookService) GetInteraction(ctx context.Context, userID, editionID uuid
 	return s.editions.GetInteraction(ctx, userID, editionID)
 }
 
+// MergeInteractionRequest is the partial-update counterpart to
+// InteractionRequest: every field is a pointer (nil string fields use ""
+// as their "no value" sentinel, matching MergeInteraction's own NULLIF
+// convention), and a nil/empty field preserves whatever the existing
+// interaction row already holds instead of overwriting it. Intended for
+// automated callers — CSV import, external sync — that only ever have
+// partial data for a given update and must not clobber fields a human
+// (or another sync) already filled in. See EditionRepo.MergeInteraction's
+// own doc comment for why this exists alongside the full-replace
+// InteractionRequest/UpsertInteraction pair.
+type MergeInteractionRequest struct {
+	ReadStatus   string
+	Rating       *int
+	Notes        string
+	Review       string
+	DateStarted  *time.Time
+	DateFinished *time.Time
+	IsFavorite   *bool
+	Progress     []byte
+}
+
+func (s *BookService) MergeInteraction(ctx context.Context, userID, editionID uuid.UUID, req MergeInteractionRequest) (*models.UserBookInteraction, error) {
+	var readStatusArg *string
+	if req.ReadStatus != "" {
+		readStatusArg = &req.ReadStatus
+	}
+	var ratingArg any
+	if req.Rating != nil {
+		ratingArg = *req.Rating
+	}
+	var notesArg *string
+	if req.Notes != "" {
+		notesArg = &req.Notes
+	}
+	var reviewArg *string
+	if req.Review != "" {
+		reviewArg = &req.Review
+	}
+	var startedArg any
+	if req.DateStarted != nil {
+		startedArg = *req.DateStarted
+	}
+	var finishedArg any
+	if req.DateFinished != nil {
+		finishedArg = *req.DateFinished
+	}
+
+	interaction, err := s.editions.MergeInteraction(ctx, userID, editionID,
+		readStatusArg, ratingArg, notesArg, reviewArg,
+		startedArg, finishedArg, req.IsFavorite, req.Progress,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if req.ReadStatus == "read" && s.suggestions != nil {
+		if edition, eerr := s.editions.FindByID(ctx, editionID); eerr == nil && edition != nil {
+			if _, derr := s.suggestions.DeleteForActionTaken(ctx, userID, edition.BookID, "read_next"); derr != nil {
+				slog.Warn("deleting read_next suggestions after read",
+					"user_id", userID, "book_id", edition.BookID, "error", derr)
+			}
+		}
+	}
+	return interaction, nil
+}
+
 func (s *BookService) UpsertInteraction(ctx context.Context, userID, editionID uuid.UUID, req InteractionRequest) (*models.UserBookInteraction, error) {
 	interaction, err := s.editions.UpsertInteraction(ctx, userID, editionID,
 		req.ReadStatus, req.Rating, req.Notes, req.Review,
