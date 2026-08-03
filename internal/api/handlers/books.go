@@ -223,6 +223,7 @@ func (h *BookHandler) ListBooks(w http.ResponseWriter, r *http.Request) {
 	tagFilter := r.URL.Query().Get("tag")
 	typeFilter := r.URL.Query().Get("type_filter")
 	isRegex, _ := strconv.ParseBool(r.URL.Query().Get("regex"))
+	isExact, _ := strconv.ParseBool(r.URL.Query().Get("exact"))
 
 	var filterGroups []repository.ConditionGroup
 	if filterJSON := r.URL.Query().Get("filter"); filterJSON != "" {
@@ -284,6 +285,7 @@ func (h *BookHandler) ListBooks(w http.ResponseWriter, r *http.Request) {
 		TagFilter:  tagFilter,
 		TypeFilter: typeFilter,
 		IsRegex:    isRegex,
+		Exact:      isExact,
 		Groups:     filterGroups,
 		CallerID:   callerID,
 	})

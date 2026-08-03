@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/fireball1725/librarium-api/internal/imports"
 	"github.com/fireball1725/librarium-api/internal/models"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -439,6 +440,13 @@ type ListBooksOpts struct {
 	TagFilter  string // filter to books that have a tag with this exact name (case-insensitive)
 	TypeFilter string // filter by media type display name (case-insensitive), e.g. "Novel"
 	IsRegex    bool   // if true, use b.title ~* $query instead of ILIKE
+	// Exact, when true with Query set, replaces the fuzzy title/author search
+	// with the same normalized-title equality check
+	// FindByNormalizedTitleInLibrary uses (lower + punctuation stripped) —
+	// takes priority over IsRegex. For scripted callers (e.g. an external
+	// sync matching a book by its exact known title) that want a single
+	// deterministic match rather than a ranked list to pick from.
+	Exact      bool
 	Groups     []ConditionGroup // from query language parser; groups are ANDed together
 	CallerID   uuid.UUID        // when non-zero, includes user_read_status for this user
 }
@@ -486,9 +494,15 @@ func (r *BookRepo) List(ctx context.Context, libraryID uuid.UUID, opts ListBooks
 	// Build WHERE conditions
 	conditions := []string{}
 
-	// Text search / regex
+	// Text search / regex / exact
 	if opts.Query != "" {
-		if opts.IsRegex {
+		if opts.Exact {
+			conditions = append(conditions, fmt.Sprintf(
+				"lower(regexp_replace(b.title, '[[:punct:]]', '', 'g')) = $%d", argIdx,
+			))
+			args = append(args, imports.NormalizeTitle(opts.Query))
+			argIdx++
+		} else if opts.IsRegex {
 			conditions = append(conditions, fmt.Sprintf("b.title ~* $%d", argIdx))
 			args = append(args, opts.Query)
 			argIdx++
