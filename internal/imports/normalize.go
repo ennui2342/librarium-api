@@ -16,6 +16,7 @@ package imports
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -140,5 +141,24 @@ func Bool(raw string) (bool, bool) {
 		return false, true
 	}
 	return false, false
+}
+
+var titlePunctRe = regexp.MustCompile(`[[:punct:]]`)
+
+// NormalizeTitle collapses a title to a comparison key: lowercased with
+// all punctuation stripped. Used as a fallback duplicate check when
+// ISBN-based dedup can't run — either the CSV row has no ISBN at all
+// (common for older/small-press titles Goodreads doesn't carry ISBN data
+// for), or the ISBN doesn't match any existing edition (e.g. the row
+// represents a different edition/printing of a book already in the
+// library). Without this, internal/workers/import_worker.go's ISBN-gated
+// duplicate check never engages for those rows and silently creates a
+// second Book record for the same work every time.
+//
+// The importer's repository-side lookup (BookRepo.FindByNormalizedTitleInLibrary)
+// must normalize stored titles with the exact same rule (lower + strip
+// [[:punct:]]) for the two sides to agree — see that method's SQL.
+func NormalizeTitle(title string) string {
+	return strings.ToLower(titlePunctRe.ReplaceAllString(title, ""))
 }
 

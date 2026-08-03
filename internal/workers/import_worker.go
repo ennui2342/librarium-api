@@ -6,6 +6,7 @@ package workers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -344,6 +345,31 @@ func (w *ImportWorker) processItem(
 		}
 	}
 
+	// ── Title fallback duplicate check ─────────────────────────────────────────
+	// The ISBN check above never engages for a row with no ISBN at all
+	// (common — Goodreads and other sources frequently lack ISBN data for
+	// older or small-press titles), or one whose ISBN belongs to a different
+	// edition/printing than what's already catalogued (e.g. a paperback vs.
+	// hardcover, or a reissue with a new ISBN). Left unchecked, either case
+	// falls straight through to "create a new book" below and silently
+	// duplicates a work already in the library. Before doing that, look for
+	// an existing book in this library with an exact normalized-title match
+	// (see imports.NormalizeTitle) and, if found, attach this row as a new
+	// edition of that book instead of creating a second Book record for the
+	// same work.
+	//
+	// Deliberately exact-match only, not fuzzy — a wrong fuzzy match would
+	// silently attach an edition to an unrelated book, which is worse than
+	// the duplicate-book status quo this is meant to fix. Book-level metadata
+	// (title, subtitle, description, contributors, tags, genres) is already
+	// established for a matched book and is left untouched; only a new
+	// edition (and this row's user-interaction data) gets added.
+	attachBookID, attachErr := w.books.FindByNormalizedTitleInLibrary(ctx, job.LibraryID, imports.NormalizeTitle(title))
+	attachToExisting := attachErr == nil
+	if attachErr != nil && !errors.Is(attachErr, repository.ErrNotFound) {
+		return models.ImportItemFailed, fmt.Sprintf("checking title match: %v", attachErr), nil, false
+	}
+
 	// CSV values are used directly; provider enrichment happens asynchronously
 	// via MetadataEnrichmentJob when opts.EnrichMetadata is true.
 	finalTitle := title
@@ -440,42 +466,50 @@ func (w *ImportWorker) processItem(
 		}
 	}
 
-	// ── Create book in transaction ────────────────────────────────────────────
-	bookID := uuid.New()
+	// ── Create book in transaction (or attach a new edition to an existing
+	//    book found by the title fallback above) ──────────────────────────────
+	bookID := attachBookID
 	tx, err := w.pool.Begin(ctx)
 	if err != nil {
 		return models.ImportItemFailed, fmt.Sprintf("begin tx: %v", err), nil, false
 	}
 	defer tx.Rollback(ctx)
 
-	if err := w.books.Create(ctx, tx, bookID,
-		finalTitle, finalSubtitle, mediaTypeID,
-		finalDescription,
-	); err != nil {
-		return models.ImportItemFailed, fmt.Sprintf("creating book: %v", err), nil, false
-	}
+	if !attachToExisting {
+		bookID = uuid.New()
+		if err := w.books.Create(ctx, tx, bookID,
+			finalTitle, finalSubtitle, mediaTypeID,
+			finalDescription,
+		); err != nil {
+			return models.ImportItemFailed, fmt.Sprintf("creating book: %v", err), nil, false
+		}
 
-	if err := w.libraryBooks.AddBookToLibrary(ctx, tx, job.LibraryID, bookID, &job.CreatedBy); err != nil {
-		return models.ImportItemFailed, fmt.Sprintf("adding book to library: %v", err), nil, false
-	}
+		if err := w.libraryBooks.AddBookToLibrary(ctx, tx, job.LibraryID, bookID, &job.CreatedBy); err != nil {
+			return models.ImportItemFailed, fmt.Sprintf("adding book to library: %v", err), nil, false
+		}
 
-	if len(contribs) > 0 {
-		if err := w.books.SetContributors(ctx, tx, bookID, contribs); err != nil {
-			return models.ImportItemFailed, fmt.Sprintf("setting contributors: %v", err), nil, false
+		if len(contribs) > 0 {
+			if err := w.books.SetContributors(ctx, tx, bookID, contribs); err != nil {
+				return models.ImportItemFailed, fmt.Sprintf("setting contributors: %v", err), nil, false
+			}
+		}
+
+		if len(tagIDs) > 0 {
+			if err := w.tags.SetBookTags(ctx, tx, bookID, tagIDs); err != nil {
+				return models.ImportItemFailed, fmt.Sprintf("setting tags: %v", err), nil, false
+			}
+		}
+
+		if len(genreIDs) > 0 {
+			if err := w.genres.SetBookGenres(ctx, tx, bookID, genreIDs); err != nil {
+				return models.ImportItemFailed, fmt.Sprintf("setting genres: %v", err), nil, false
+			}
 		}
 	}
-
-	if len(tagIDs) > 0 {
-		if err := w.tags.SetBookTags(ctx, tx, bookID, tagIDs); err != nil {
-			return models.ImportItemFailed, fmt.Sprintf("setting tags: %v", err), nil, false
-		}
-	}
-
-	if len(genreIDs) > 0 {
-		if err := w.genres.SetBookGenres(ctx, tx, bookID, genreIDs); err != nil {
-			return models.ImportItemFailed, fmt.Sprintf("setting genres: %v", err), nil, false
-		}
-	}
+	// else: attaching to an existing book — its title, subtitle,
+	// description, contributors, tags, and genres are already established
+	// and are deliberately left untouched. This row only contributes a new
+	// edition below (plus this user's copy/reading data for it).
 
 	format := models.NormalizeEditionFormat(opts.DefaultFormat)
 	editionLang := finalLanguage
@@ -493,11 +527,15 @@ func (w *ImportWorker) processItem(
 		}
 	}
 
+	// isPrimary is false when attaching to an existing book — the book's
+	// established edition stays primary; this new one is additional
+	// (a different printing, format, or the ISBN-less/mismatched row that
+	// triggered the title-fallback match above), not a replacement.
 	editionID := uuid.New()
 	if err := w.editions.Create(ctx, tx, editionID, bookID,
 		format, editionLang, "", "", finalPublisher,
 		publishDate, finalISBN10, finalISBN13, finalDescription,
-		nil, pageCount, true, nil,
+		nil, pageCount, !attachToExisting, nil,
 	); err != nil {
 		return models.ImportItemFailed, fmt.Sprintf("creating edition: %v", err), nil, false
 	}
@@ -522,9 +560,13 @@ func (w *ImportWorker) processItem(
 	// rolling back the whole row.
 	w.applyInteraction(ctx, editionID, interactionUserID, row)
 
-	// addedToLibrary=true: a fresh book + edition row was created in
-	// this run and added to the target library. Always queue for
-	// post-import enrichment.
+	// addedToLibrary=true either way: either a fresh book + edition was
+	// created, or a new edition was attached to an existing book — both
+	// cases add a new edition row that's missing metadata/cover, so both
+	// get queued for post-import enrichment.
+	if attachToExisting {
+		return models.ImportItemDone, fmt.Sprintf("added new edition of existing book %q", finalTitle), &bookID, true
+	}
 	return models.ImportItemDone, fmt.Sprintf("imported %q", finalTitle), &bookID, true
 }
 
