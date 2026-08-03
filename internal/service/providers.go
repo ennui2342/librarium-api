@@ -258,7 +258,24 @@ func (s *ProviderService) SearchBooks(ctx context.Context, query string) []*prov
 // canceled" under the 5s default when racing five other providers
 // concurrently — 5s wasn't a safety margin for ISFDB here, it was cutting
 // it off before it could realistically finish under real contention.
-const bestMatchesSearchDeadline = 15 * time.Second
+//
+// 20s (not the original 15s) to hold up now that isfdb.go's
+// searchEditionsPerTitle/searchLimit fetch a title's full edition set
+// rather than a small fixed cap — verified live, the worst real case
+// (Dracula, 348 editions) took 5.73s single-provider, but that leaves less
+// margin than the Neuromancer case did, hence the larger deadline here.
+const bestMatchesSearchDeadline = 20 * time.Second
+
+// bestMatchesResultLimit caps the response *after* scoring and sorting —
+// the only place a result-count limit is actually safe to apply. isfdb.go
+// deliberately fetches a title's full edition set (up to 400/500 — see its
+// searchEditionsPerTitle/searchLimit comment) specifically so nothing gets
+// excluded before ranking can see it; capping before ranking is exactly
+// the bug this feature was built to fix. Once everything is scored and
+// sorted best-first, keeping only the top N is free of that risk — the
+// candidates being dropped are, by construction, the ones that scored
+// lowest, not ones the caller had no way to know weren't the best.
+const bestMatchesResultLimit = 30
 
 // searchAndRank runs `search` (either the registry's default-deadline
 // SearchBooks or a deadline override) then applies the same provider-
@@ -348,6 +365,9 @@ func (s *ProviderService) BestMatches(ctx context.Context, known BookFields) []S
 		scored[i] = ScoreCandidate(known, c)
 	}
 	stableSort(scored, func(a, b ScoredResult) bool { return a.Score > b.Score })
+	if len(scored) > bestMatchesResultLimit {
+		scored = scored[:bestMatchesResultLimit]
+	}
 	return scored
 }
 

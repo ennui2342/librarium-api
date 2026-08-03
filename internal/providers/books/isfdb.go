@@ -261,17 +261,23 @@ func (b *isfdbBook) toBookResult() *providers.BookResult {
 // ─── BookSearchProvider ─────────────────────────────────────────────────────────
 
 // searchEditionsPerTitle/searchLimit override the adapter's own defaults
-// (10 editions per matched title, 20 results total) — found live
-// 2026-08-03: a title with many editions (Neuromancer has 66) can easily
-// have its most-recent printings fall outside the default oldest-first
-// cap entirely (the 1993 printing ranked ~17th oldest), so no amount of
-// Go-side ranking can surface an edition the adapter never returned in
-// the first place. Values are generous but still bounded — not unlimited,
-// since each additional edition costs the adapter several more DB
-// round-trips (see book_result_from_pub in the adapter).
+// (10 editions per matched title, 20 results total). The adapter orders
+// editions oldest-first before Go-side ranking ever sees them — any fixed
+// cap smaller than a title's real edition count silently excludes whatever
+// fell past it, regardless of how good the ranking algorithm is. This was
+// tuned to 25 once (matching Neuromancer's 66 editions, target ~17th
+// oldest) but that was curve-fitting to one example: ISFDB's own data has
+// far more prolific titles — Dracula alone has 348 editions, several
+// classics exceed 150 — so a small fixed cap just relocates the same bug
+// to a longer tail. The correctness-safe design is to filter *after*
+// ranking, not before: fetch generously here (verified live 2026-08-03,
+// Dracula's full ~400-candidate response took 5.73s single-provider,
+// comfortably inside BestMatches' deadline — see providers.go), let
+// ScoreCandidate rank the complete set, and truncate for display only
+// after that ranking has happened (bestMatchesResultLimit in providers.go).
 const (
-	searchEditionsPerTitle = 25
-	searchLimit            = 60
+	searchEditionsPerTitle = 400
+	searchLimit            = 500
 )
 
 func (p *ISFDBProvider) SearchBooks(ctx context.Context, query string) ([]*providers.BookResult, error) {
