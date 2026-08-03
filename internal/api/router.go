@@ -366,6 +366,7 @@ func NewRouter(ctx context.Context, db *pgxpool.Pool, cfg *config.Config, riverC
 	// User reading interactions (per edition, per caller)
 	mux.Handle("GET /api/v1/libraries/{library_id}/books/{book_id}/editions/{edition_id}/my-interaction", requireLibraryPerm("books:read", http.HandlerFunc(bookHandler.GetMyInteraction)))
 	mux.Handle("PUT /api/v1/libraries/{library_id}/books/{book_id}/editions/{edition_id}/my-interaction", requireLibraryPerm("books:read", http.HandlerFunc(bookHandler.UpsertMyInteraction)))
+	mux.Handle("PATCH /api/v1/libraries/{library_id}/books/{book_id}/editions/{edition_id}/my-interaction", requireLibraryPerm("books:read", http.HandlerFunc(bookHandler.MergeMyInteraction)))
 	mux.Handle("DELETE /api/v1/libraries/{library_id}/books/{book_id}/editions/{edition_id}/my-interaction", requireLibraryPerm("books:read", http.HandlerFunc(bookHandler.DeleteMyInteraction)))
 
 	// Loans

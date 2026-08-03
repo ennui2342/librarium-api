@@ -247,6 +247,44 @@ func (h *BookHandler) UpsertMyInteraction(w http.ResponseWriter, r *http.Request
 	respond.JSON(w, http.StatusOK, interactionBody(i))
 }
 
+// MergeMyInteraction godoc
+//
+// @Summary     Partially update my reading interaction
+// @Description Merges fields into the current user's reading interaction for an edition — any field omitted (or, for string fields, left empty) preserves the existing value instead of clearing it. Unlike PUT, which always replaces the full record, this is safe for automated callers (e.g. an external tracker sync) that only ever have partial data for a given update.
+// @Tags        editions
+// @Accept      json
+// @Produce     json
+// @Security    BearerAuth
+// @Param       library_id   path      string  true  "Library UUID"
+// @Param       book_id      path      string  true  "Book UUID"
+// @Param       edition_id   path      string  true  "Edition UUID"
+// @Param       body         body      object{read_status=string,rating=integer,notes=string,review=string,date_started=string,date_finished=string,is_favorite=boolean}  true  "Fields to merge — omit any field to leave it unchanged"
+// @Success     200  {object}  responses.InteractionResponse
+// @Failure     400  {object}  object{error=string}
+// @Failure     401  {object}  object{error=string}
+// @Router      /libraries/{library_id}/books/{book_id}/editions/{edition_id}/my-interaction [patch]
+func (h *BookHandler) MergeMyInteraction(w http.ResponseWriter, r *http.Request) {
+	editionID, err := uuid.Parse(r.PathValue("edition_id"))
+	if err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid edition id")
+		return
+	}
+	claims := middleware.ClaimsFromContext(r.Context())
+
+	req, err := decodeMergeInteractionRequest(r)
+	if err != nil {
+		respond.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	i, err := h.svc.MergeInteraction(r.Context(), claims.UserID, editionID, *req)
+	if err != nil {
+		respond.ServerError(w, r, err)
+		return
+	}
+	respond.JSON(w, http.StatusOK, interactionBody(i))
+}
+
 // DeleteMyInteraction godoc
 //
 // @Summary     Delete my reading interaction
@@ -396,6 +434,57 @@ func decodeInteractionRequest(r *http.Request) (*service.InteractionRequest, err
 	}
 
 	return &service.InteractionRequest{
+		ReadStatus:   body.ReadStatus,
+		Rating:       body.Rating,
+		Notes:        body.Notes,
+		Review:       body.Review,
+		DateStarted:  dateStarted,
+		DateFinished: dateFinished,
+		IsFavorite:   body.IsFavorite,
+		Progress:     body.Progress,
+	}, nil
+}
+
+type mergeInteractionRequestBody struct {
+	ReadStatus   string          `json:"read_status"`
+	Rating       *int            `json:"rating"`
+	Notes        string          `json:"notes"`
+	Review       string          `json:"review"`
+	DateStarted  string          `json:"date_started"`  // YYYY-MM-DD or "" (omit to leave unchanged)
+	DateFinished string          `json:"date_finished"` // YYYY-MM-DD or "" (omit to leave unchanged)
+	IsFavorite   *bool           `json:"is_favorite"`
+	Progress     json.RawMessage `json:"progress"`
+}
+
+// decodeMergeInteractionRequest differs from decodeInteractionRequest in the
+// one way that matters for merge semantics: it never defaults ReadStatus to
+// "unread" when omitted (that default is correct for the PUT/replace flow,
+// where the client always sends the full record, but would wrongly force
+// every partial update back to "unread" here) and IsFavorite decodes as a
+// *bool so "omitted" and "explicitly false" stay distinguishable.
+func decodeMergeInteractionRequest(r *http.Request) (*service.MergeInteractionRequest, error) {
+	var body mergeInteractionRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return nil, errors.New("invalid request body")
+	}
+
+	var dateStarted, dateFinished *time.Time
+	if body.DateStarted != "" {
+		t, err := time.Parse("2006-01-02", body.DateStarted)
+		if err != nil {
+			return nil, errors.New("date_started must be YYYY-MM-DD")
+		}
+		dateStarted = &t
+	}
+	if body.DateFinished != "" {
+		t, err := time.Parse("2006-01-02", body.DateFinished)
+		if err != nil {
+			return nil, errors.New("date_finished must be YYYY-MM-DD")
+		}
+		dateFinished = &t
+	}
+
+	return &service.MergeInteractionRequest{
 		ReadStatus:   body.ReadStatus,
 		Rating:       body.Rating,
 		Notes:        body.Notes,
