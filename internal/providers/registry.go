@@ -139,8 +139,26 @@ func (r *Registry) BookSearchProviders() []BookSearchProvider {
 var searchDeadline = 5 * time.Second
 
 // SearchBooks queries all enabled BookSearchProviders concurrently and returns
-// as soon as every provider has responded OR the deadline is reached.
+// as soon as every provider has responded OR searchDeadline (started after
+// the first response) is reached. Thin wrapper around
+// SearchBooksWithDeadline — see that doc for the full mechanics.
 func (r *Registry) SearchBooks(ctx context.Context, query string) []*BookResult {
+	return r.SearchBooksWithDeadline(ctx, query, searchDeadline)
+}
+
+// SearchBooksWithDeadline is SearchBooks with an explicit grace period
+// instead of the package-default searchDeadline. Exists because not every
+// caller has the same latency budget: a quick freetext search (the "By
+// Title" tab) wants the default snappy 5s cutoff, but the "Best Matches"
+// flow is already a deliberately slower, more thorough operation the user
+// is waiting on once per book — and it specifically needs ISFDB's depth
+// (many editions per title means more per-title DB round-trips in the
+// mirror adapter), so cutting ISFDB off at the same 5s used for a plain
+// title search defeats the point of that flow. Found live 2026-08-03: ISFDB
+// answered a real query in ~1s in isolation but was still getting dropped
+// via "context canceled" under the default deadline when racing five other
+// providers concurrently.
+func (r *Registry) SearchBooksWithDeadline(ctx context.Context, query string, deadline time.Duration) []*BookResult {
 	providers := r.BookSearchProviders()
 	slog.InfoContext(ctx, "book search start", "query", query, "providers", len(providers))
 	if len(providers) == 0 {
@@ -168,13 +186,12 @@ func (r *Registry) SearchBooks(ctx context.Context, query string) []*BookResult 
 	}
 
 	// deadlineC stays nil (blocks forever in the select below) until the
-	// first result arrives, matching searchDeadline's doc comment: lagging
-	// providers get searchDeadline *after* a fast one has already
-	// responded, not a flat searchDeadline from the start of the search.
-	// Before any result exists there's no fast provider to protect, so we
-	// wait unboundedly for the first one — each provider's own HTTP client
-	// timeout is still the real worst-case bound, since every goroutine
-	// below sends to ch when its call returns, success or error.
+	// first result arrives: lagging providers get `deadline` *after* a fast
+	// one has already responded, not a flat deadline from the start of the
+	// search. Before any result exists there's no fast provider to protect,
+	// so we wait unboundedly for the first one — each provider's own HTTP
+	// client timeout is still the real worst-case bound, since every
+	// goroutine below sends to ch when its call returns, success or error.
 	var deadlineC <-chan time.Time
 
 	var out []*BookResult
@@ -185,9 +202,9 @@ func (r *Registry) SearchBooks(ctx context.Context, query string) []*BookResult 
 			out = append(out, res.items...)
 			remaining--
 			if deadlineC == nil {
-				deadline := time.NewTimer(searchDeadline)
-				defer deadline.Stop()
-				deadlineC = deadline.C
+				timer := time.NewTimer(deadline)
+				defer timer.Stop()
+				deadlineC = timer.C
 			}
 		case <-deadlineC:
 			slog.InfoContext(ctx, "book search deadline reached, returning partial results",
