@@ -243,9 +243,12 @@ func (h *BookHandler) ListBooks(w http.ResponseWriter, r *http.Request) {
 				filterGroups = []repository.ConditionGroup{{Mode: oldFmt.Mode, Conditions: oldFmt.Conditions}}
 			}
 		}
-	} else if q != "" {
+	} else if q != "" && !isExact {
 		// Parse the raw query string using the backend query language parser.
 		// Clients can send q=bleach+not+type:Manga; the server handles the full parse.
+		// Skipped in exact mode — exact=true means "this is a literal title
+		// to match, not a query-language expression," so q must survive
+		// into ListBooksOpts.Query for BookRepo.List's Exact branch.
 		parsed := search.Parse(q)
 		q = "" // groups take over; clear the legacy simple-text-search fallback
 
