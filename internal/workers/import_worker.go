@@ -6,7 +6,6 @@ package workers
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -90,7 +89,7 @@ func (w *ImportWorker) Work(ctx context.Context, job *river.Job[models.ImportJob
 		return nil
 	}
 
-	if err := w.importJobs.UpdateJobStatus(ctx, jobID, models.ImportJobProcessing, 0, 0, 0); err != nil {
+	if err := w.importJobs.UpdateJobStatus(ctx, jobID, models.ImportJobProcessing, 0, 0, 0, 0); err != nil {
 		return fmt.Errorf("marking job as processing: %w", err)
 	}
 
@@ -106,7 +105,7 @@ func (w *ImportWorker) Work(ctx context.Context, job *river.Job[models.ImportJob
 		return fmt.Errorf("loading genres: %w", err)
 	}
 
-	var processed, failed, skipped int
+	var processed, failed, skipped, needsReview int
 	var newBooks []importedBook // tracks newly created books for post-import enrichment batches
 	for _, item := range items {
 		// Check for cancellation before each item so the worker stops promptly.
@@ -115,8 +114,14 @@ func (w *ImportWorker) Work(ctx context.Context, job *river.Job[models.ImportJob
 			return nil
 		}
 
-		status, msg, bookID, addedToLibrary := w.processItem(ctx, importJob, &item, tagCache, allGenres)
-		_ = w.importJobs.UpdateItemStatus(ctx, item.ID, status, msg, bookID)
+		status, msg, bookID, addedToLibrary, candidates := w.processItem(ctx, importJob, &item, tagCache, allGenres)
+		if status == models.ImportItemNeedsReview {
+			// Needs its own persistence call — UpdateItemStatus has no
+			// slot for the candidate list a human will resolve against.
+			_ = w.importJobs.SetItemNeedsReview(ctx, item.ID, msg, candidates)
+		} else {
+			_ = w.importJobs.UpdateItemStatus(ctx, item.ID, status, msg, bookID)
+		}
 
 		switch status {
 		case models.ImportItemDone:
@@ -143,12 +148,24 @@ func (w *ImportWorker) Work(ctx context.Context, job *river.Job[models.ImportJob
 			)
 		case models.ImportItemSkipped:
 			skipped++
+		case models.ImportItemNeedsReview:
+			needsReview++
+			slog.Info("import row needs review",
+				"import_job_id", jobID,
+				"row", item.RowNumber,
+				"title", item.Title,
+				"candidates", len(candidates),
+			)
 		}
-		_ = w.importJobs.UpdateJobStatus(ctx, jobID, models.ImportJobProcessing, processed, failed, skipped)
+		_ = w.importJobs.UpdateJobStatus(ctx, jobID, models.ImportJobProcessing, processed, failed, skipped, needsReview)
 	}
 
+	// A needs_review row does not block the job from completing — it's a
+	// per-row parked state, not a job-level failure. needsReview is
+	// reflected in the job's own counter for visibility (see the Jobs
+	// history UI) and each row is followed up individually via ResolveItem.
 	finalStatus := models.ImportJobDone
-	if err := w.importJobs.UpdateJobStatus(ctx, jobID, finalStatus, processed, failed, skipped); err != nil {
+	if err := w.importJobs.UpdateJobStatus(ctx, jobID, finalStatus, processed, failed, skipped, needsReview); err != nil {
 		return fmt.Errorf("finalizing import job: %w", err)
 	}
 
@@ -169,6 +186,7 @@ func (w *ImportWorker) Work(ctx context.Context, job *river.Job[models.ImportJob
 		"processed", processed,
 		"failed", failed,
 		"skipped", skipped,
+		"needs_review", needsReview,
 	)
 	return nil
 }
@@ -258,19 +276,20 @@ func (w *ImportWorker) spawnEnrichmentBatch(
 	}
 }
 
-// processItem returns the per-row outcome plus an addedToLibrary flag
-// the caller uses to gate post-import enrichment fan-out. The flag is
-// true for any row that newly placed a book into the target library
-// (true creates AND links of editions from other libraries) — both
-// are "added" from the user's perspective. It's false for pure
-// in-library duplicates and skipped rows.
+// processItem returns the per-row outcome plus an addedToLibrary flag the
+// caller uses to gate post-import enrichment fan-out, and — only when the
+// status is ImportItemNeedsReview — the candidate books a human can later
+// resolve the row against via ResolveItem. addedToLibrary is true for any
+// row that newly placed a book into the target library (true creates AND
+// links of editions from other libraries); false for in-library
+// duplicates, skipped rows, and needs_review rows (nothing was added yet).
 func (w *ImportWorker) processItem(
 	ctx context.Context,
 	job *models.ImportJob,
 	item *models.ImportJobItem,
 	tagCache map[string]uuid.UUID,
 	allGenres []*models.Genre,
-) (models.ImportItemStatus, string, *uuid.UUID, bool) {
+) (models.ImportItemStatus, string, *uuid.UUID, bool, []models.TitleMatchCandidate) {
 	opts := job.Options
 	row := item.RawData
 
@@ -284,7 +303,7 @@ func (w *ImportWorker) processItem(
 
 	title := strings.TrimSpace(row["title"])
 	if title == "" {
-		return models.ImportItemSkipped, "no title", nil, false
+		return models.ImportItemSkipped, "no title", nil, false, nil
 	}
 
 	isbn := strings.TrimSpace(row["isbn_13"])
@@ -304,7 +323,7 @@ func (w *ImportWorker) processItem(
 		if err == nil && existing != nil {
 			inLibrary, ierr := w.libraryBooks.IsBookInLibrary(ctx, job.LibraryID, existing.BookID)
 			if ierr != nil {
-				return models.ImportItemFailed, fmt.Sprintf("checking library membership: %v", ierr), nil, false
+				return models.ImportItemFailed, fmt.Sprintf("checking library membership: %v", ierr), nil, false, nil
 			}
 			bookID := existing.BookID
 
@@ -312,7 +331,7 @@ func (w *ImportWorker) processItem(
 				// First time this library is seeing the edition — add it
 				// and seed the user-interaction fields from the CSV row.
 				if addErr := w.libraryBooks.AddBookToLibrary(ctx, nil, job.LibraryID, bookID, &job.CreatedBy); addErr != nil {
-					return models.ImportItemFailed, fmt.Sprintf("adding book to library: %v", addErr), nil, false
+					return models.ImportItemFailed, fmt.Sprintf("adding book to library: %v", addErr), nil, false, nil
 				}
 				w.applyInteraction(ctx, existing.ID, interactionUserID, row)
 				// addedToLibrary=true: the book is new to *this* library
@@ -321,7 +340,7 @@ func (w *ImportWorker) processItem(
 				// in if the original-library import skipped that step.
 				// The metadata and cover workers no-op when the data is
 				// already present.
-				return models.ImportItemDone, fmt.Sprintf("linked existing edition (ISBN %s) into this library", isbn), &bookID, true
+				return models.ImportItemDone, fmt.Sprintf("linked existing edition (ISBN %s) into this library", isbn), &bookID, true, nil
 			}
 
 			// True duplicate — book is already in this library. Apply the
@@ -330,7 +349,7 @@ func (w *ImportWorker) processItem(
 			actions := make([]string, 0, 2)
 			if opts.DuplicateIncrementCopyCount {
 				if incrErr := w.editions.IncrementCopyCount(ctx, job.LibraryID, existing.ID); incrErr != nil {
-					return models.ImportItemFailed, fmt.Sprintf("increment copy count: %v", incrErr), nil, false
+					return models.ImportItemFailed, fmt.Sprintf("increment copy count: %v", incrErr), nil, false, nil
 				}
 				actions = append(actions, "copy count incremented")
 			}
@@ -339,9 +358,9 @@ func (w *ImportWorker) processItem(
 				actions = append(actions, "user fields updated")
 			}
 			if len(actions) == 0 {
-				return models.ImportItemSkipped, fmt.Sprintf("duplicate ISBN %s — skipped", isbn), &bookID, false
+				return models.ImportItemSkipped, fmt.Sprintf("duplicate ISBN %s — skipped", isbn), &bookID, false, nil
 			}
-			return models.ImportItemDone, fmt.Sprintf("duplicate ISBN %s — %s", isbn, strings.Join(actions, ", ")), &bookID, false
+			return models.ImportItemDone, fmt.Sprintf("duplicate ISBN %s — %s", isbn, strings.Join(actions, ", ")), &bookID, false, nil
 		}
 	}
 
@@ -353,26 +372,81 @@ func (w *ImportWorker) processItem(
 	// hardcover, or a reissue with a new ISBN). Left unchecked, either case
 	// falls straight through to "create a new book" below and silently
 	// duplicates a work already in the library. Before doing that, look for
-	// an existing book in this library with an exact normalized-title match
-	// (see imports.NormalizeTitle) and, if found, attach this row as a new
-	// edition of that book instead of creating a second Book record for the
-	// same work.
+	// existing books in this library with an exact normalized-title match
+	// (see imports.NormalizeTitle).
 	//
-	// Deliberately exact-match only, not fuzzy — a wrong fuzzy match would
-	// silently attach an edition to an unrelated book, which is worse than
-	// the duplicate-book status quo this is meant to fix. Book-level metadata
-	// (title, subtitle, description, contributors, tags, genres) is already
-	// established for a matched book and is left untouched; only a new
-	// edition (and this row's user-interaction data) gets added.
-	attachBookID, attachErr := w.books.FindByNormalizedTitleInLibrary(ctx, job.LibraryID, imports.NormalizeTitle(title))
-	attachToExisting := attachErr == nil
-	if attachErr != nil && !errors.Is(attachErr, repository.ErrNotFound) {
-		return models.ImportItemFailed, fmt.Sprintf("checking title match: %v", attachErr), nil, false
+	// A title match alone is not proof of a duplicate — two distinct books
+	// can share a title. So the match is only auto-resolved (attach this
+	// row as a new edition of the matched book) when there is exactly one
+	// candidate AND the row's author overlaps that book's contributors.
+	// Anything less certain — no author data to check, no overlap, or more
+	// than one candidate — is deliberately NOT guessed: a wrong guess here
+	// would silently attach an edition to the wrong book (or skip creating
+	// a book that should exist), which is worse than the duplicate-book
+	// status quo this is meant to fix. Those rows come back as
+	// ImportItemNeedsReview with the candidates a human can resolve
+	// against via ResolveItem, instead of falling through to either
+	// outcome automatically.
+	candidates, candErr := w.books.FindCandidatesByNormalizedTitleInLibrary(ctx, job.LibraryID, imports.NormalizeTitle(title))
+	if candErr != nil {
+		return models.ImportItemFailed, fmt.Sprintf("checking title match: %v", candErr), nil, false, nil
 	}
+
+	var attachBookID *uuid.UUID
+	switch {
+	case len(candidates) == 1 && authorsOverlap(rowAuthorNames(row), candidates[0].Authors):
+		id := candidates[0].BookID
+		attachBookID = &id
+	case len(candidates) > 0:
+		msg := fmt.Sprintf("title matches %d existing book(s) but the match couldn't be confirmed by author — needs review", len(candidates))
+		return models.ImportItemNeedsReview, msg, nil, false, candidates
+	}
+	attachToExisting := attachBookID != nil
+
+	bookID, editionID, err := w.createOrAttachEdition(ctx, job, row, tagCache, allGenres, attachBookID)
+	if err != nil {
+		return models.ImportItemFailed, err.Error(), nil, false, nil
+	}
+
+	// User-interaction fields are applied after the book/edition is
+	// committed so that a per-user `user_book_interactions` row points
+	// at a real `book_edition_id`. Failures here are non-fatal — the
+	// book is already imported, so we log and move on rather than
+	// rolling back the whole row.
+	w.applyInteraction(ctx, editionID, interactionUserID, row)
+
+	// addedToLibrary=true either way: either a fresh book + edition was
+	// created, or a new edition was attached to an existing book — both
+	// cases add a new edition row that's missing metadata/cover, so both
+	// get queued for post-import enrichment.
+	if attachToExisting {
+		return models.ImportItemDone, fmt.Sprintf("added new edition of existing book %q", title), &bookID, true, nil
+	}
+	return models.ImportItemDone, fmt.Sprintf("imported %q", title), &bookID, true, nil
+}
+
+// createOrAttachEdition creates a new book+edition from row, or — when
+// attachBookID is non-nil — attaches row as a new (non-primary) edition of
+// that existing book, leaving the book's own title/subtitle/description/
+// contributors/tags/genres untouched (already established by whatever
+// created the book originally). Shared by processItem's two non-ambiguous
+// outcomes and ResolveItem's human-driven resolution of a needs_review
+// item, so the two code paths can't drift apart on how a book/edition
+// actually gets created.
+func (w *ImportWorker) createOrAttachEdition(
+	ctx context.Context,
+	job *models.ImportJob,
+	row map[string]string,
+	tagCache map[string]uuid.UUID,
+	allGenres []*models.Genre,
+	attachBookID *uuid.UUID,
+) (bookID, editionID uuid.UUID, err error) {
+	opts := job.Options
+	attachToExisting := attachBookID != nil
 
 	// CSV values are used directly; provider enrichment happens asynchronously
 	// via MetadataEnrichmentJob when opts.EnrichMetadata is true.
-	finalTitle := title
+	title := strings.TrimSpace(row["title"])
 	finalSubtitle := row["subtitle"]
 	finalDescription := row["description"]
 	finalPublisher := row["publisher"]
@@ -383,7 +457,7 @@ func (w *ImportWorker) processItem(
 	var publishDate *time.Time
 	if ds := strings.TrimSpace(row["publish_date"]); ds != "" {
 		for _, layout := range []string{"2006-01-02", "2006-01", "2006", "January 2, 2006", "Jan 2, 2006"} {
-			if t, err := time.Parse(layout, ds); err == nil {
+			if t, perr := time.Parse(layout, ds); perr == nil {
 				publishDate = &t
 				break
 			}
@@ -391,9 +465,9 @@ func (w *ImportWorker) processItem(
 	}
 
 	// ── Media type ────────────────────────────────────────────────────────────
-	mediaTypes, err := w.books.ListMediaTypes(ctx)
-	if err != nil {
-		return models.ImportItemFailed, fmt.Sprintf("loading media types: %v", err), nil, false
+	mediaTypes, mtErr := w.books.ListMediaTypes(ctx)
+	if mtErr != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("loading media types: %w", mtErr)
 	}
 	mediaTypeID := findMediaTypeID(mediaTypes, row["media_type"])
 	if mediaTypeID == uuid.Nil {
@@ -413,9 +487,9 @@ func (w *ImportWorker) processItem(
 	if authorStr := strings.TrimSpace(row["author"]); authorStr != "" {
 		for i, rawName := range splitAuthors(authorStr) {
 			name, role := parseContributorNameRole(rawName)
-			c, err := w.findOrCreateContributor(ctx, name)
-			if err != nil {
-				slog.Warn("contributor find/create failed", "name", name, "error", err)
+			c, cErr := w.findOrCreateContributor(ctx, name)
+			if cErr != nil {
+				slog.Warn("contributor find/create failed", "name", name, "error", cErr)
 				continue
 			}
 			contribs = append(contribs, repository.ContributorInput{
@@ -434,9 +508,9 @@ func (w *ImportWorker) processItem(
 			if name == "" {
 				continue
 			}
-			id, err := w.resolveTag(ctx, job.LibraryID, job.CreatedBy, name, tagCache)
-			if err != nil {
-				slog.Warn("resolving tag", "name", name, "error", err)
+			id, tErr := w.resolveTag(ctx, job.LibraryID, job.CreatedBy, name, tagCache)
+			if tErr != nil {
+				slog.Warn("resolving tag", "name", name, "error", tErr)
 				continue
 			}
 			tagIDs = append(tagIDs, id)
@@ -467,49 +541,50 @@ func (w *ImportWorker) processItem(
 	}
 
 	// ── Create book in transaction (or attach a new edition to an existing
-	//    book found by the title fallback above) ──────────────────────────────
-	bookID := attachBookID
-	tx, err := w.pool.Begin(ctx)
-	if err != nil {
-		return models.ImportItemFailed, fmt.Sprintf("begin tx: %v", err), nil, false
+	//    book) ──────────────────────────────────────────────────────────────
+	tx, txErr := w.pool.Begin(ctx)
+	if txErr != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("begin tx: %w", txErr)
 	}
 	defer tx.Rollback(ctx)
 
-	if !attachToExisting {
+	if attachToExisting {
+		bookID = *attachBookID
+		// title, subtitle, description, contributors, tags, and genres are
+		// already established on the matched book and are deliberately
+		// left untouched — this row only contributes a new edition below
+		// (plus this user's copy/reading data for it).
+	} else {
 		bookID = uuid.New()
-		if err := w.books.Create(ctx, tx, bookID,
-			finalTitle, finalSubtitle, mediaTypeID,
+		if cErr := w.books.Create(ctx, tx, bookID,
+			title, finalSubtitle, mediaTypeID,
 			finalDescription,
-		); err != nil {
-			return models.ImportItemFailed, fmt.Sprintf("creating book: %v", err), nil, false
+		); cErr != nil {
+			return uuid.Nil, uuid.Nil, fmt.Errorf("creating book: %w", cErr)
 		}
 
-		if err := w.libraryBooks.AddBookToLibrary(ctx, tx, job.LibraryID, bookID, &job.CreatedBy); err != nil {
-			return models.ImportItemFailed, fmt.Sprintf("adding book to library: %v", err), nil, false
+		if aErr := w.libraryBooks.AddBookToLibrary(ctx, tx, job.LibraryID, bookID, &job.CreatedBy); aErr != nil {
+			return uuid.Nil, uuid.Nil, fmt.Errorf("adding book to library: %w", aErr)
 		}
 
 		if len(contribs) > 0 {
-			if err := w.books.SetContributors(ctx, tx, bookID, contribs); err != nil {
-				return models.ImportItemFailed, fmt.Sprintf("setting contributors: %v", err), nil, false
+			if sErr := w.books.SetContributors(ctx, tx, bookID, contribs); sErr != nil {
+				return uuid.Nil, uuid.Nil, fmt.Errorf("setting contributors: %w", sErr)
 			}
 		}
 
 		if len(tagIDs) > 0 {
-			if err := w.tags.SetBookTags(ctx, tx, bookID, tagIDs); err != nil {
-				return models.ImportItemFailed, fmt.Sprintf("setting tags: %v", err), nil, false
+			if sErr := w.tags.SetBookTags(ctx, tx, bookID, tagIDs); sErr != nil {
+				return uuid.Nil, uuid.Nil, fmt.Errorf("setting tags: %w", sErr)
 			}
 		}
 
 		if len(genreIDs) > 0 {
-			if err := w.genres.SetBookGenres(ctx, tx, bookID, genreIDs); err != nil {
-				return models.ImportItemFailed, fmt.Sprintf("setting genres: %v", err), nil, false
+			if sErr := w.genres.SetBookGenres(ctx, tx, bookID, genreIDs); sErr != nil {
+				return uuid.Nil, uuid.Nil, fmt.Errorf("setting genres: %w", sErr)
 			}
 		}
 	}
-	// else: attaching to an existing book — its title, subtitle,
-	// description, contributors, tags, and genres are already established
-	// and are deliberately left untouched. This row only contributes a new
-	// edition below (plus this user's copy/reading data for it).
 
 	format := models.NormalizeEditionFormat(opts.DefaultFormat)
 	editionLang := finalLanguage
@@ -520,7 +595,7 @@ func (w *ImportWorker) processItem(
 	var acquiredAt *time.Time
 	if ds := strings.TrimSpace(row["acquired_date"]); ds != "" {
 		for _, layout := range []string{"2006-01-02", "2006-01", "2006", "January 2, 2006", "Jan 2, 2006"} {
-			if t, err := time.Parse(layout, ds); err == nil {
+			if t, perr := time.Parse(layout, ds); perr == nil {
 				acquiredAt = &t
 				break
 			}
@@ -531,13 +606,13 @@ func (w *ImportWorker) processItem(
 	// established edition stays primary; this new one is additional
 	// (a different printing, format, or the ISBN-less/mismatched row that
 	// triggered the title-fallback match above), not a replacement.
-	editionID := uuid.New()
-	if err := w.editions.Create(ctx, tx, editionID, bookID,
+	editionID = uuid.New()
+	if eErr := w.editions.Create(ctx, tx, editionID, bookID,
 		format, editionLang, "", "", finalPublisher,
 		publishDate, finalISBN10, finalISBN13, finalDescription,
 		nil, pageCount, !attachToExisting, nil,
-	); err != nil {
-		return models.ImportItemFailed, fmt.Sprintf("creating edition: %v", err), nil, false
+	); eErr != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("creating edition: %w", eErr)
 	}
 	// Record this library's copy of the new edition.
 	var acq *any
@@ -545,29 +620,149 @@ func (w *ImportWorker) processItem(
 		v := any(*acquiredAt)
 		acq = &v
 	}
-	if err := w.libraryBooks.SetEditionCopyCount(ctx, tx, job.LibraryID, editionID, 1, acq); err != nil {
-		return models.ImportItemFailed, fmt.Sprintf("setting library copy count: %v", err), nil, false
+	if sErr := w.libraryBooks.SetEditionCopyCount(ctx, tx, job.LibraryID, editionID, 1, acq); sErr != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("setting library copy count: %w", sErr)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return models.ImportItemFailed, fmt.Sprintf("commit: %v", err), nil, false
+	if cErr := tx.Commit(ctx); cErr != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("commit: %w", cErr)
 	}
 
-	// User-interaction fields are applied after the book/edition is
-	// committed so that a per-user `user_book_interactions` row points
-	// at a real `book_edition_id`. Failures here are non-fatal — the
-	// book is already imported, so we log and move on rather than
-	// rolling back the whole row.
-	w.applyInteraction(ctx, editionID, interactionUserID, row)
+	return bookID, editionID, nil
+}
 
-	// addedToLibrary=true either way: either a fresh book + edition was
-	// created, or a new edition was attached to an existing book — both
-	// cases add a new edition row that's missing metadata/cover, so both
-	// get queued for post-import enrichment.
-	if attachToExisting {
-		return models.ImportItemDone, fmt.Sprintf("added new edition of existing book %q", finalTitle), &bookID, true
+// ResolveItem applies a human decision to a needs_review item — one whose
+// title-fallback match couldn't be auto-resolved by processItem. action is
+// "attach" (bookID, required, must be one of the item's stored candidates —
+// add this row as a new edition of that existing book) or "create" (import
+// the row as a brand-new book, exactly as processItem does when no
+// candidate exists at all). Runs synchronously — a single row's writes are
+// small enough that routing through River for one item would only add
+// latency, not buy anything.
+func (w *ImportWorker) ResolveItem(ctx context.Context, jobID, itemID uuid.UUID, action string, bookID *uuid.UUID) (*models.ImportJobItem, error) {
+	item, err := w.importJobs.GetItem(ctx, itemID)
+	if err != nil {
+		return nil, err
 	}
-	return models.ImportItemDone, fmt.Sprintf("imported %q", finalTitle), &bookID, true
+	if item.ImportJobID != jobID {
+		return nil, repository.ErrNotFound
+	}
+	if item.Status != models.ImportItemNeedsReview {
+		return nil, fmt.Errorf("item is not awaiting review (status %q)", item.Status)
+	}
+
+	job, err := w.importJobs.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("loading import job: %w", err)
+	}
+
+	var attachBookID *uuid.UUID
+	switch action {
+	case "attach":
+		if bookID == nil {
+			return nil, fmt.Errorf("book_id is required for the attach action")
+		}
+		valid := false
+		for _, c := range item.Candidates {
+			if c.BookID == *bookID {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return nil, fmt.Errorf("book_id is not one of this item's candidates")
+		}
+		attachBookID = bookID
+	case "create":
+		// attachBookID stays nil — createOrAttachEdition creates a new book.
+	default:
+		return nil, fmt.Errorf("unknown action %q (must be \"attach\" or \"create\")", action)
+	}
+
+	allGenres, err := w.genres.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("loading genres: %w", err)
+	}
+	tagCache := make(map[string]uuid.UUID)
+
+	resolvedBookID, editionID, err := w.createOrAttachEdition(ctx, job, item.RawData, tagCache, allGenres, attachBookID)
+	if err != nil {
+		return nil, err
+	}
+
+	interactionUserID := job.CreatedBy
+	if job.Options.AttributeToUserID != nil {
+		interactionUserID = *job.Options.AttributeToUserID
+	}
+	w.applyInteraction(ctx, editionID, interactionUserID, item.RawData)
+
+	var resultMsg string
+	if attachBookID != nil {
+		resultMsg = fmt.Sprintf("resolved: added new edition of existing book %q", item.Title)
+	} else {
+		resultMsg = fmt.Sprintf("resolved: imported %q as a new book", item.Title)
+	}
+	if err := w.importJobs.UpdateItemStatus(ctx, itemID, models.ImportItemDone, resultMsg, &resolvedBookID); err != nil {
+		return nil, fmt.Errorf("updating item status: %w", err)
+	}
+
+	// The job already finished — needs_review rows don't block completion
+	// (see Work) — so this just reflects the row's resolution in the job's
+	// counters without touching its status.
+	newProcessed := job.ProcessedRows + 1
+	newNeedsReview := job.NeedsReviewRows - 1
+	if newNeedsReview < 0 {
+		newNeedsReview = 0
+	}
+	if err := w.importJobs.UpdateJobStatus(ctx, jobID, job.Status, newProcessed, job.FailedRows, job.SkippedRows, newNeedsReview); err != nil {
+		return nil, fmt.Errorf("updating job counters: %w", err)
+	}
+
+	if w.riverClient != nil && w.batches != nil && item.Title != "" {
+		booksToEnrich := []importedBook{{id: resolvedBookID, title: item.Title}}
+		if job.Options.EnrichMetadata {
+			w.spawnEnrichmentBatch(ctx, job, booksToEnrich, models.EnrichmentBatchTypeMetadata)
+		}
+		if job.Options.EnrichCovers {
+			w.spawnEnrichmentBatch(ctx, job, booksToEnrich, models.EnrichmentBatchTypeCover)
+		}
+	}
+
+	return w.importJobs.GetItem(ctx, itemID)
+}
+
+// rowAuthorNames extracts plain contributor names (role annotations like
+// "(Illustrator)" stripped) from an import row's author field, for
+// comparing against an existing book's contributors during title-fallback
+// matching.
+func rowAuthorNames(row map[string]string) []string {
+	authorStr := strings.TrimSpace(row["author"])
+	if authorStr == "" {
+		return nil
+	}
+	names := make([]string, 0, 4)
+	for _, raw := range splitAuthors(authorStr) {
+		name, _ := parseContributorNameRole(raw)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// authorsOverlap reports whether any name in a appears (case-insensitively)
+// in b — the tiebreak used to decide whether a title-fallback match is
+// safe to auto-attach. Same heuristic already validated live in the
+// Goodreads-sync pipelines' own author-based disambiguation.
+func authorsOverlap(a, b []string) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if strings.EqualFold(strings.TrimSpace(x), strings.TrimSpace(y)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // applyInteraction reads the user-interaction columns out of an import

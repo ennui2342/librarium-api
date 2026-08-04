@@ -439,9 +439,10 @@ func main() {
 	go scheduler.Run(baseCtx)
 
 	handler := api.NewRouter(baseCtx, pool, cfg, riverClient, metrics, api.RouterDeps{
-		JobRegistry: jobRegistry,
-		AISvc:       aiSvc,
-		ProviderSvc: providerSvc,
+		JobRegistry:  jobRegistry,
+		AISvc:        aiSvc,
+		ProviderSvc:  providerSvc,
+		ImportWorker: importWorker,
 	})
 	srv := &http.Server{
 		Addr:           addr,

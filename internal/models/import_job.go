@@ -30,11 +30,27 @@ const (
 type ImportItemStatus string
 
 const (
-	ImportItemPending  ImportItemStatus = "pending"
-	ImportItemDone     ImportItemStatus = "done"
-	ImportItemSkipped  ImportItemStatus = "skipped"
-	ImportItemFailed   ImportItemStatus = "failed"
+	ImportItemPending ImportItemStatus = "pending"
+	ImportItemDone    ImportItemStatus = "done"
+	ImportItemSkipped ImportItemStatus = "skipped"
+	ImportItemFailed  ImportItemStatus = "failed"
+	// ImportItemNeedsReview marks a row whose title matched an existing
+	// book but couldn't be confirmed as the same work (no author overlap,
+	// or more than one candidate) — the worker deliberately stops short of
+	// guessing and waits for a human to resolve it via
+	// POST .../items/{id}/resolve rather than risk silently attaching an
+	// edition to the wrong book or creating an unwanted duplicate.
+	ImportItemNeedsReview ImportItemStatus = "needs_review"
 )
+
+// TitleMatchCandidate is one existing book that shares a normalized title
+// with an import row, surfaced for human review when the match can't be
+// auto-resolved (see BookRepo.FindCandidatesByNormalizedTitleInLibrary).
+type TitleMatchCandidate struct {
+	BookID  uuid.UUID `json:"book_id"`
+	Title   string    `json:"title"`
+	Authors []string  `json:"authors"`
+}
 
 // ImportOptions holds per-import configuration stored in the DB. The
 // duplicate_* flags replace the older skip_duplicates toggle: with both
@@ -75,31 +91,36 @@ type MetadataEnrichmentJobArgs struct {
 func (MetadataEnrichmentJobArgs) Kind() string { return "metadata_enrichment" }
 
 type ImportJob struct {
-	ID            uuid.UUID       `json:"id"`
-	LibraryID     uuid.UUID       `json:"library_id"`
-	LibraryName   string          `json:"library_name,omitempty"`
-	CreatedBy     uuid.UUID       `json:"created_by"`
-	Status        ImportJobStatus `json:"status"`
-	TotalRows     int             `json:"total_rows"`
-	ProcessedRows int             `json:"processed_rows"`
-	FailedRows    int             `json:"failed_rows"`
-	SkippedRows   int             `json:"skipped_rows"`
-	Options       ImportOptions   `json:"options"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
-	Items         []ImportJobItem `json:"items,omitempty"`
+	ID              uuid.UUID       `json:"id"`
+	LibraryID       uuid.UUID       `json:"library_id"`
+	LibraryName     string          `json:"library_name,omitempty"`
+	CreatedBy       uuid.UUID       `json:"created_by"`
+	Status          ImportJobStatus `json:"status"`
+	TotalRows       int             `json:"total_rows"`
+	ProcessedRows   int             `json:"processed_rows"`
+	FailedRows      int             `json:"failed_rows"`
+	SkippedRows     int             `json:"skipped_rows"`
+	NeedsReviewRows int             `json:"needs_review_rows"`
+	Options         ImportOptions   `json:"options"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	Items           []ImportJobItem `json:"items,omitempty"`
 }
 
 type ImportJobItem struct {
-	ID          uuid.UUID        `json:"id"`
-	ImportJobID uuid.UUID        `json:"import_job_id"`
-	RowNumber   int              `json:"row_number"`
+	ID          uuid.UUID         `json:"id"`
+	ImportJobID uuid.UUID         `json:"import_job_id"`
+	RowNumber   int               `json:"row_number"`
 	RawData     map[string]string `json:"raw_data"`
-	Status      ImportItemStatus `json:"status"`
-	Title       string           `json:"title"`
-	ISBN        string           `json:"isbn"`
-	Message     string           `json:"message"`
-	BookID      *uuid.UUID       `json:"book_id,omitempty"`
-	CreatedAt   time.Time        `json:"created_at"`
-	UpdatedAt   time.Time        `json:"updated_at"`
+	Status      ImportItemStatus  `json:"status"`
+	Title       string            `json:"title"`
+	ISBN        string            `json:"isbn"`
+	Message     string            `json:"message"`
+	BookID      *uuid.UUID        `json:"book_id,omitempty"`
+	// Candidates is populated only when Status is ImportItemNeedsReview —
+	// the set of existing books a human can resolve this row against via
+	// the resolve endpoint's "attach" action.
+	Candidates []TitleMatchCandidate `json:"candidates,omitempty"`
+	CreatedAt  time.Time             `json:"created_at"`
+	UpdatedAt  time.Time             `json:"updated_at"`
 }

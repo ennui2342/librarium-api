@@ -80,7 +80,7 @@ func (r *ImportJobRepo) CreateJob(ctx context.Context, job *models.ImportJob, it
 // GetJob returns an import job with all its items.
 func (r *ImportJobRepo) GetJob(ctx context.Context, id uuid.UUID) (*models.ImportJob, error) {
 	const qJob = `
-		SELECT id, library_id, created_by, status, total_rows, processed_rows, failed_rows, skipped_rows, options, created_at, updated_at
+		SELECT id, library_id, created_by, status, total_rows, processed_rows, failed_rows, skipped_rows, needs_review_rows, options, created_at, updated_at
 		FROM import_jobs WHERE id = $1`
 
 	var (
@@ -93,7 +93,7 @@ func (r *ImportJobRepo) GetJob(ctx context.Context, id uuid.UUID) (*models.Impor
 	row := r.db.QueryRow(ctx, qJob, id)
 	if err := row.Scan(
 		&pgID, &pgLibraryID, &pgCreatedBy,
-		&job.Status, &job.TotalRows, &job.ProcessedRows, &job.FailedRows, &job.SkippedRows,
+		&job.Status, &job.TotalRows, &job.ProcessedRows, &job.FailedRows, &job.SkippedRows, &job.NeedsReviewRows,
 		&optJSON, &job.CreatedAt, &job.UpdatedAt,
 	); errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -129,7 +129,7 @@ func (r *ImportJobRepo) GetJobByLibrary(ctx context.Context, libraryID, jobID uu
 
 func (r *ImportJobRepo) listItems(ctx context.Context, jobID uuid.UUID) ([]models.ImportJobItem, error) {
 	const q = `
-		SELECT id, import_job_id, row_number, raw_data, status, title, isbn, message, book_id, created_at, updated_at
+		SELECT id, import_job_id, row_number, raw_data, status, title, isbn, message, book_id, candidates, created_at, updated_at
 		FROM import_job_items
 		WHERE import_job_id = $1
 		ORDER BY row_number`
@@ -154,17 +154,17 @@ func (r *ImportJobRepo) listItems(ctx context.Context, jobID uuid.UUID) ([]model
 // It never overwrites a 'cancelled' status so a user cancel cannot be
 // undone by the worker. Mirrors the status and progress counters to the
 // umbrella jobs row so unified history stays in sync.
-func (r *ImportJobRepo) UpdateJobStatus(ctx context.Context, id uuid.UUID, status models.ImportJobStatus, processed, failed, skipped int) error {
+func (r *ImportJobRepo) UpdateJobStatus(ctx context.Context, id uuid.UUID, status models.ImportJobStatus, processed, failed, skipped, needsReview int) error {
 	const q = `
 		UPDATE import_jobs
-		SET status = $2, processed_rows = $3, failed_rows = $4, skipped_rows = $5, updated_at = now()
+		SET status = $2, processed_rows = $3, failed_rows = $4, skipped_rows = $5, needs_review_rows = $6, updated_at = now()
 		WHERE id = $1 AND status != 'cancelled'
 		RETURNING job_id, total_rows`
 	var (
 		pgJobID pgtype.UUID
 		total   int
 	)
-	if err := r.db.QueryRow(ctx, q, id, string(status), processed, failed, skipped).Scan(&pgJobID, &total); err != nil {
+	if err := r.db.QueryRow(ctx, q, id, string(status), processed, failed, skipped, needsReview).Scan(&pgJobID, &total); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil // already cancelled / missing
 		}
@@ -174,18 +174,20 @@ func (r *ImportJobRepo) UpdateJobStatus(ctx context.Context, id uuid.UUID, statu
 		const updJob = `
 			UPDATE jobs
 			   SET status      = $2,
-			       progress    = jsonb_build_object('processed', $3::int, 'failed', $4::int, 'skipped', $5::int, 'total', $6::int),
+			       progress    = jsonb_build_object('processed', $3::int, 'failed', $4::int, 'skipped', $5::int, 'needs_review', $6::int, 'total', $7::int),
 			       started_at  = CASE WHEN $2 = 'running' AND started_at IS NULL THEN NOW() ELSE started_at END,
 			       finished_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN COALESCE(finished_at, NOW()) ELSE finished_at END
 			 WHERE id = $1`
-		if _, err := r.db.Exec(ctx, updJob, uuid.UUID(pgJobID.Bytes), normalizeStatusForJobs(string(status)), processed, failed, skipped, total); err != nil {
+		if _, err := r.db.Exec(ctx, updJob, uuid.UUID(pgJobID.Bytes), normalizeStatusForJobs(string(status)), processed, failed, skipped, needsReview, total); err != nil {
 			return fmt.Errorf("mirroring status to umbrella job: %w", err)
 		}
 	}
 	return nil
 }
 
-// UpdateItemStatus updates a single item's status and message.
+// UpdateItemStatus updates a single item's status and message. Not used for
+// transitions into ImportItemNeedsReview — that also needs to persist the
+// candidate list, so it goes through SetItemNeedsReview instead.
 func (r *ImportJobRepo) UpdateItemStatus(ctx context.Context, id uuid.UUID, status models.ImportItemStatus, message string, bookID *uuid.UUID) error {
 	const q = `
 		UPDATE import_job_items
@@ -197,12 +199,44 @@ func (r *ImportJobRepo) UpdateItemStatus(ctx context.Context, id uuid.UUID, stat
 	return nil
 }
 
+// SetItemNeedsReview marks an item as needing human review and records the
+// candidate books the title-fallback match found but couldn't auto-resolve.
+func (r *ImportJobRepo) SetItemNeedsReview(ctx context.Context, id uuid.UUID, message string, candidates []models.TitleMatchCandidate) error {
+	candJSON, err := json.Marshal(candidates)
+	if err != nil {
+		return fmt.Errorf("marshaling candidates: %w", err)
+	}
+	const q = `
+		UPDATE import_job_items
+		SET status = 'needs_review', message = $2, candidates = $3, updated_at = now()
+		WHERE id = $1`
+	if _, err := r.db.Exec(ctx, q, id, message, candJSON); err != nil {
+		return fmt.Errorf("setting import job item needs_review: %w", err)
+	}
+	return nil
+}
+
+// GetItem returns a single import job item by id.
+func (r *ImportJobRepo) GetItem(ctx context.Context, id uuid.UUID) (*models.ImportJobItem, error) {
+	const q = `
+		SELECT id, import_job_id, row_number, raw_data, status, title, isbn, message, book_id, candidates, created_at, updated_at
+		FROM import_job_items
+		WHERE id = $1`
+	item, err := scanImportItem(r.db.QueryRow(ctx, q, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
 // ListByUser returns all import jobs created by a user across all libraries, newest first.
 // The library name is populated via a JOIN.
 func (r *ImportJobRepo) ListByUser(ctx context.Context, userID uuid.UUID) ([]models.ImportJob, error) {
 	const q = `
 		SELECT ij.id, ij.library_id, ij.created_by, ij.status,
-		       ij.total_rows, ij.processed_rows, ij.failed_rows, ij.skipped_rows,
+		       ij.total_rows, ij.processed_rows, ij.failed_rows, ij.skipped_rows, ij.needs_review_rows,
 		       ij.options, ij.created_at, ij.updated_at, l.name
 		FROM import_jobs ij
 		JOIN libraries l ON l.id = ij.library_id
@@ -225,7 +259,7 @@ func (r *ImportJobRepo) ListByUser(ctx context.Context, userID uuid.UUID) ([]mod
 		)
 		if err := rows.Scan(
 			&pgID, &pgLibraryID, &pgCreatedBy,
-			&job.Status, &job.TotalRows, &job.ProcessedRows, &job.FailedRows, &job.SkippedRows,
+			&job.Status, &job.TotalRows, &job.ProcessedRows, &job.FailedRows, &job.SkippedRows, &job.NeedsReviewRows,
 			&optJSON, &job.CreatedAt, &job.UpdatedAt, &job.LibraryName,
 		); err != nil {
 			return nil, fmt.Errorf("scanning import job: %w", err)
@@ -261,7 +295,7 @@ func (r *ImportJobRepo) CancelJob(ctx context.Context, jobID, userID uuid.UUID) 
 // ListByLibrary returns all import jobs for a library, newest first, without items.
 func (r *ImportJobRepo) ListByLibrary(ctx context.Context, libraryID uuid.UUID) ([]models.ImportJob, error) {
 	const q = `
-		SELECT id, library_id, created_by, status, total_rows, processed_rows, failed_rows, skipped_rows, options, created_at, updated_at
+		SELECT id, library_id, created_by, status, total_rows, processed_rows, failed_rows, skipped_rows, needs_review_rows, options, created_at, updated_at
 		FROM import_jobs
 		WHERE library_id = $1
 		ORDER BY created_at DESC`
@@ -282,7 +316,7 @@ func (r *ImportJobRepo) ListByLibrary(ctx context.Context, libraryID uuid.UUID) 
 		)
 		if err := rows.Scan(
 			&pgID, &pgLibraryID, &pgCreatedBy,
-			&job.Status, &job.TotalRows, &job.ProcessedRows, &job.FailedRows, &job.SkippedRows,
+			&job.Status, &job.TotalRows, &job.ProcessedRows, &job.FailedRows, &job.SkippedRows, &job.NeedsReviewRows,
 			&optJSON, &job.CreatedAt, &job.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scanning import job: %w", err)
@@ -328,7 +362,7 @@ func (r *ImportJobRepo) DeleteFinishedJobs(ctx context.Context, userID uuid.UUID
 // ListPendingItems returns all pending items for a job, ordered by row_number.
 func (r *ImportJobRepo) ListPendingItems(ctx context.Context, jobID uuid.UUID) ([]models.ImportJobItem, error) {
 	const q = `
-		SELECT id, import_job_id, row_number, raw_data, status, title, isbn, message, book_id, created_at, updated_at
+		SELECT id, import_job_id, row_number, raw_data, status, title, isbn, message, book_id, candidates, created_at, updated_at
 		FROM import_job_items
 		WHERE import_job_id = $1 AND status = 'pending'
 		ORDER BY row_number`
@@ -355,13 +389,14 @@ func scanImportItem(s scanner) (*models.ImportJobItem, error) {
 		pgJobID  pgtype.UUID
 		pgBookID pgtype.UUID
 		rawJSON  []byte
+		candJSON []byte
 		item     models.ImportJobItem
 	)
 
 	if err := s.Scan(
 		&pgID, &pgJobID, &item.RowNumber, &rawJSON,
 		&item.Status, &item.Title, &item.ISBN, &item.Message,
-		&pgBookID, &item.CreatedAt, &item.UpdatedAt,
+		&pgBookID, &candJSON, &item.CreatedAt, &item.UpdatedAt,
 	); err != nil {
 		return nil, fmt.Errorf("scanning import item: %w", err)
 	}
@@ -374,6 +409,11 @@ func scanImportItem(s scanner) (*models.ImportJobItem, error) {
 	if len(rawJSON) > 0 {
 		if err := json.Unmarshal(rawJSON, &item.RawData); err != nil {
 			return nil, fmt.Errorf("unmarshaling raw data: %w", err)
+		}
+	}
+	if len(candJSON) > 0 {
+		if err := json.Unmarshal(candJSON, &item.Candidates); err != nil {
+			return nil, fmt.Errorf("unmarshaling candidates: %w", err)
 		}
 	}
 	return &item, nil
