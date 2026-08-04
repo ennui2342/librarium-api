@@ -17,6 +17,7 @@ import (
 	"github.com/fireball1725/librarium-api/internal/jobs"
 	"github.com/fireball1725/librarium-api/internal/repository"
 	"github.com/fireball1725/librarium-api/internal/service"
+	"github.com/fireball1725/librarium-api/internal/workers"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
@@ -37,6 +38,10 @@ type RouterDeps struct {
 	AISvc       *service.AIService
 	ProviderSvc *service.ProviderService
 	JobRegistry *jobs.Registry
+	// ImportWorker is shared with the River worker process so
+	// ResolveImportItem's create/attach logic can't drift from what the
+	// async import job itself does — see ImportHandler's doc comment.
+	ImportWorker *workers.ImportWorker
 }
 
 func NewRouter(ctx context.Context, db *pgxpool.Pool, cfg *config.Config, riverClient *river.Client[pgx.Tx], metrics MetricsCollector, deps RouterDeps) http.Handler {
@@ -119,7 +124,7 @@ func NewRouter(ctx context.Context, db *pgxpool.Pool, cfg *config.Config, riverC
 	aiMetadataRepo := repository.NewAIMetadataRepo(db)
 	aiMetadataSvc := service.NewAIMetadataService(aiSvc.Registry(), aiMetadataRepo)
 	aiMetadataHandler := handlers.NewAIMetadataHandler(aiMetadataSvc, seriesRepo, seriesArcRepo, aiMetadataRepo)
-	importHandler := handlers.NewImportHandler(importSvc, membershipRepo)
+	importHandler := handlers.NewImportHandler(importSvc, membershipRepo, deps.ImportWorker)
 	genreHandler := handlers.NewGenreHandler(genreRepo)
 	mediaTypeHandler := handlers.NewMediaTypeHandler(mediaTypeRepo)
 	syncHandler := handlers.NewSyncHandler(syncRepo)
@@ -457,6 +462,7 @@ func NewRouter(ctx context.Context, db *pgxpool.Pool, cfg *config.Config, riverC
 	mux.Handle("GET /api/v1/libraries/{library_id}/imports", requireLibraryPerm("books:read", http.HandlerFunc(importHandler.ListImports)))
 	mux.Handle("POST /api/v1/libraries/{library_id}/imports", requireLibraryPerm("books:create", http.HandlerFunc(importHandler.CreateImport)))
 	mux.Handle("GET /api/v1/libraries/{library_id}/imports/{import_id}", requireLibraryPerm("books:read", http.HandlerFunc(importHandler.GetImport)))
+	mux.Handle("POST /api/v1/libraries/{library_id}/imports/{import_id}/items/{item_id}/resolve", requireLibraryPerm("books:create", http.HandlerFunc(importHandler.ResolveImportItem)))
 
 	// Genres (instance-level; read for all authenticated, write for admins)
 	mux.Handle("GET /api/v1/genres", requireAuth(http.HandlerFunc(genreHandler.ListGenres)))

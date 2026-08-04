@@ -777,31 +777,54 @@ func (r *BookRepo) List(ctx context.Context, libraryID uuid.UUID, opts ListBooks
 	return books, total, nil
 }
 
-// FindByNormalizedTitleInLibrary looks up a book already held by the given
-// library whose title, lowercased with punctuation stripped, exactly
-// matches normalizedTitle. Used by the CSV importer as a fallback duplicate
-// check when ISBN-based dedup can't run (no ISBN on the row, or the ISBN
-// belongs to a different edition/printing than what's already catalogued)
-// — see imports.NormalizeTitle, which callers must use to produce
-// normalizedTitle so both sides agree on the same normalization rule.
-// Returns ErrNotFound if no book in this library has a matching title.
-func (r *BookRepo) FindByNormalizedTitleInLibrary(ctx context.Context, libraryID uuid.UUID, normalizedTitle string) (uuid.UUID, error) {
+// FindCandidatesByNormalizedTitleInLibrary looks up every book already held
+// by the given library whose title, lowercased with punctuation stripped,
+// exactly matches normalizedTitle — along with each candidate's contributor
+// names, so the caller can attempt an author-overlap tiebreak before
+// deciding whether the match is safe to auto-resolve. Used by the CSV
+// importer as a fallback duplicate check when ISBN-based dedup can't run
+// (no ISBN on the row, or the ISBN belongs to a different edition/printing
+// than what's already catalogued) — see imports.NormalizeTitle, which
+// callers must use to produce normalizedTitle so both sides agree on the
+// same normalization rule.
+//
+// Deliberately returns every match rather than the first one (the previous
+// FindByNormalizedTitleInLibrary behavior): a title match is not, by
+// itself, proof of a duplicate — two distinct books can share a title, and
+// silently picking the first row risked attaching an edition to the wrong
+// book with no way to tell after the fact. Multiple candidates, or a single
+// candidate whose authors don't overlap the import row's, is exactly the
+// case the caller should treat as ambiguous rather than guess.
+func (r *BookRepo) FindCandidatesByNormalizedTitleInLibrary(ctx context.Context, libraryID uuid.UUID, normalizedTitle string) ([]models.TitleMatchCandidate, error) {
 	const q = `
-		SELECT b.id
+		SELECT b.id, b.title,
+		       COALESCE(
+		           ARRAY_AGG(c.name ORDER BY bc.display_order, c.name)
+		               FILTER (WHERE c.name IS NOT NULL),
+		           '{}'
+		       ) AS authors
 		FROM books b
 		JOIN library_books lb ON lb.book_id = b.id
+		LEFT JOIN book_contributors bc ON bc.book_id = b.id
+		LEFT JOIN contributors c ON c.id = bc.contributor_id
 		WHERE lb.library_id = $1
 		  AND lower(regexp_replace(b.title, '[[:punct:]]', '', 'g')) = $2
-		LIMIT 1`
-	var id uuid.UUID
-	err := r.db.QueryRow(ctx, q, libraryID, normalizedTitle).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, ErrNotFound
-	}
+		GROUP BY b.id, b.title`
+	rows, err := r.db.Query(ctx, q, libraryID, normalizedTitle)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("finding book by normalized title: %w", err)
+		return nil, fmt.Errorf("finding books by normalized title: %w", err)
 	}
-	return id, nil
+	defer rows.Close()
+
+	var out []models.TitleMatchCandidate
+	for rows.Next() {
+		var cand models.TitleMatchCandidate
+		if err := rows.Scan(&cand.BookID, &cand.Title, &cand.Authors); err != nil {
+			return nil, fmt.Errorf("scanning title match candidate: %w", err)
+		}
+		out = append(out, cand)
+	}
+	return out, rows.Err()
 }
 
 // SearchSuggestions returns up to 5 book titles in the library whose

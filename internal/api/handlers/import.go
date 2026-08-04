@@ -16,16 +16,24 @@ import (
 	"github.com/fireball1725/librarium-api/internal/models"
 	"github.com/fireball1725/librarium-api/internal/repository"
 	"github.com/fireball1725/librarium-api/internal/service"
+	"github.com/fireball1725/librarium-api/internal/workers"
 	"github.com/google/uuid"
 )
 
 type ImportHandler struct {
 	svc         *service.ImportService
 	memberships *repository.MembershipRepo
+	// worker is used directly (bypassing ImportService) only for
+	// ResolveImportItem: the create/attach logic it needs to reuse lives on
+	// ImportWorker, which already imports internal/service (for
+	// contributor sort-name derivation) — routing this through
+	// ImportService instead would need the reverse dependency and create
+	// an import cycle.
+	worker *workers.ImportWorker
 }
 
-func NewImportHandler(svc *service.ImportService, memberships *repository.MembershipRepo) *ImportHandler {
-	return &ImportHandler{svc: svc, memberships: memberships}
+func NewImportHandler(svc *service.ImportService, memberships *repository.MembershipRepo, worker *workers.ImportWorker) *ImportHandler {
+	return &ImportHandler{svc: svc, memberships: memberships, worker: worker}
 }
 
 // CreateImport godoc
@@ -370,4 +378,95 @@ func (h *ImportHandler) GetImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respond.JSON(w, http.StatusOK, job)
+}
+
+// resolveItemRequestBody is the JSON body for ResolveImportItem.
+type resolveItemRequestBody struct {
+	Action string     `json:"action"`
+	BookID *uuid.UUID `json:"book_id,omitempty"`
+}
+
+// ResolveImportItem godoc
+//
+// @Summary     Resolve an ambiguous import item
+// @Description Applies a human decision to an import row the worker parked as needs_review — either attach it as a new edition of one of the candidate books it found, or import it as a brand-new book.
+// @Tags        imports
+// @Accept      json
+// @Produce     json
+// @Security    BearerAuth
+// @Param       library_id  path  string  true  "Library UUID"
+// @Param       import_id   path  string  true  "Import job UUID"
+// @Param       item_id     path  string  true  "Import job item UUID"
+// @Param       body        body  resolveItemRequestBody  true  "action: attach|create, book_id required for attach"
+// @Success     200  {object}  models.ImportJobItem
+// @Failure     400  {object}  object{error=string}
+// @Failure     401  {object}  object{error=string}
+// @Failure     404  {object}  object{error=string}
+// @Router      /libraries/{library_id}/imports/{import_id}/items/{item_id}/resolve [post]
+func (h *ImportHandler) ResolveImportItem(w http.ResponseWriter, r *http.Request) {
+	caller := middleware.ClaimsFromContext(r.Context())
+	if caller == nil {
+		respond.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	libraryID, err := uuid.Parse(r.PathValue("library_id"))
+	if err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid library id")
+		return
+	}
+	importID, err := uuid.Parse(r.PathValue("import_id"))
+	if err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid import id")
+		return
+	}
+	itemID, err := uuid.Parse(r.PathValue("item_id"))
+	if err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid item id")
+		return
+	}
+
+	// Confirms the job belongs to this library before touching the item —
+	// requireLibraryPerm already checked the caller's permission on
+	// libraryID, this just guards against an item_id/import_id pair that
+	// doesn't actually belong to it.
+	if _, err := h.svc.GetImportStatus(r.Context(), libraryID, importID); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			respond.Error(w, http.StatusNotFound, "import not found")
+			return
+		}
+		respond.ServerError(w, r, err)
+		return
+	}
+
+	var body resolveItemRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respond.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if body.Action != "attach" && body.Action != "create" {
+		respond.Error(w, http.StatusBadRequest, `action must be "attach" or "create"`)
+		return
+	}
+	if body.Action == "attach" && body.BookID == nil {
+		respond.Error(w, http.StatusBadRequest, "book_id is required for the attach action")
+		return
+	}
+
+	item, err := h.worker.ResolveItem(r.Context(), importID, itemID, body.Action, body.BookID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			respond.Error(w, http.StatusNotFound, "import item not found")
+			return
+		}
+		// Anything else here is a caller error (wrong status, book_id not
+		// among the candidates, unknown action) rather than a server
+		// fault — ResolveItem never wraps a genuine infra failure inside
+		// one of these paths without the DB/network error text showing
+		// through, so 400 is the right default rather than 500.
+		respond.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	respond.JSON(w, http.StatusOK, item)
 }
