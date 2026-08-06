@@ -18,6 +18,13 @@ func TestPublishYear(t *testing.T) {
 		{"0000-00-00", ""},
 		{"May 1973", "1973"},
 		{"73", ""},
+		// Known limitation, not fixed here: publishYear takes the first four
+		// consecutive digits it finds, so a leading number that isn't the
+		// year (an ordinal like "20th" here) shadows the real one. Harmless
+		// today — this only narrows a dedup key, and an empty year just
+		// falls back to matching on "" — but documented so a future change
+		// to this parser doesn't silently alter dedup behavior unnoticed.
+		{"20th Century Fox, 1973", ""},
 	}
 	for _, tc := range cases {
 		if got := publishYear(tc.in); got != tc.want {
@@ -26,13 +33,18 @@ func TestPublishYear(t *testing.T) {
 	}
 }
 
-// TestRankAndDeduplicateBooks_SameISBNDifferentPrintings reproduces a real
-// case found via the ISFDB provider: Panther/Granada reused ISBN 0586028463
+// TestRankAndDeduplicateBooks_SameISBNDifferentPrintings documents a
+// deliberate tradeoff, not a bug fix: Panther/Granada reused ISBN 0586028463
 // across three separate print runs of "Camp Concentration" (1969, 1973,
-// 1977). Keying dedup on ISBN alone collapsed all three into one result and
-// silently discarded the other two printings' data — including whichever
-// one a user was actually trying to find by year. Each distinct printing
-// must survive as its own result.
+// 1977), and ISBN dedup alone can't tell those apart. An earlier version of
+// this fix folded year into the ISBN key to split cases like this one, but
+// that traded a rare correctness win for a common regression — providers
+// routinely disagree about publication year for the very same ISBN (original
+// publication vs. printing in hand), so exact-year matching on the ISBN key
+// turned single real editions into false duplicates far more often than it
+// ever caught a genuine reprint. ISBN alone remains the merge key; distinct
+// printings sharing one ISBN merge into a single result, same as before this
+// PR. See internal/service/providers.go's bookKeys comment.
 func TestRankAndDeduplicateBooks_SameISBNDifferentPrintings(t *testing.T) {
 	mk := func(publisher, year string) *providers.BookResult {
 		return &providers.BookResult{
@@ -50,12 +62,8 @@ func TestRankAndDeduplicateBooks_SameISBNDifferentPrintings(t *testing.T) {
 		mk("Panther / Granada", "1977"),
 	}
 	out := rankAndDeduplicateBooks(results, nil)
-	if len(out) != 3 {
-		years := make([]string, len(out))
-		for i, r := range out {
-			years[i] = r.PublishDate
-		}
-		t.Fatalf("got %d results %v, want 3 distinct printings", len(out), years)
+	if len(out) != 1 {
+		t.Fatalf("got %d results, want 1 merged result — ISBN alone is the merge key, so same-ISBN printings merge regardless of year", len(out))
 	}
 }
 

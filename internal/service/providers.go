@@ -356,17 +356,22 @@ func mergeBookResult(dst, src *providers.BookResult) {
 // Sharing any key means two results represent the same book.
 func bookKeys(r *providers.BookResult) []string {
 	var keys []string
-	// Publishers (Panther/Granada especially, in ISFDB's data) commonly reuse
-	// one ISBN across several print runs of the same book years apart. Keying
-	// on ISBN alone would collapse those distinct printings into one, so fold
-	// in year too — an ISBN shared across differing years is treated as
-	// different editions, not a duplicate.
+	// ISBN alone is kept as the merge key, deliberately not folded together
+	// with year: providers disagree about publication year for the same ISBN
+	// constantly (one reports the original publication, another the printing
+	// in hand), so requiring exact year agreement here would split a single
+	// real edition into duplicates far more often than it would ever catch a
+	// genuine reprint. A publisher reusing one ISBN across separate print
+	// runs years apart (e.g. Panther/Granada reprints in ISFDB's data) is a
+	// real but rarer case than that common false split, and isn't handled by
+	// this key — see TestRankAndDeduplicateBooks_SameISBNDifferentPrintings'
+	// updated expectation.
 	y := publishYear(r.PublishDate)
 	if r.ISBN13 != "" {
-		keys = append(keys, "13:"+r.ISBN13+"|"+y)
+		keys = append(keys, "13:"+r.ISBN13)
 	}
 	if r.ISBN10 != "" {
-		keys = append(keys, "10:"+r.ISBN10+"|"+y)
+		keys = append(keys, "10:"+r.ISBN10)
 	}
 	t := normalizeBookToken(r.Title)
 	if t != "" && len(r.Authors) > 0 {
